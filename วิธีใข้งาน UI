@@ -1,0 +1,43 @@
+local SilL = loadstring(game:HttpGet("ลิงก์ไฟล์ของคุณ"))()
+
+local Window = SilL:CreateWindow({
+    Name = "My Hub",
+    Subtitle = "by SilL",
+    Theme = "Midnight",
+    ToggleKey = Enum.KeyCode.RightShift,
+    Size = UDim2.fromOffset(600, 440),
+    Config = { Enabled = true, Folder = "MyHub", FileName = "default", AutoSave = true },
+})
+
+local Main = Window:CreateTab("Main")
+local Combat = Main:CreateSection("Player")
+
+Combat:CreateToggle({ Name = "Auto Farm", Description = "เก็บของอัตโนมัติ", Flag = "AutoFarm",
+    Tooltip = "เปิดค้างไว้ได้", Callback = function(v) print("AutoFarm", v) end })
+
+Combat:CreateSlider({ Name = "WalkSpeed", Range = {16, 200}, Increment = 1, Suffix = "studs",
+    CurrentValue = 16, Flag = "WS", Callback = function(v)
+        local hum = game.Players.LocalPlayer.Character and game.Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = v end
+    end })
+
+local dd = Main:CreateDropdown({ Name = "Select Areas", Options = {"Forest", "Desert", "Snow"},
+    MultipleOptions = true, Flag = "Areas", Callback = function(t) print(table.concat(t, ", ")) end })
+
+Main:CreateKeybind({ Name = "Sprint (Hold)", CurrentKeybind = "LeftShift", HoldToInteract = true,
+    Callback = function(holding) print("Sprint:", holding) end })
+
+Main:CreateColorPicker({ Name = "ESP Color", Color = Color3.fromRGB(255, 80, 80), Flag = "ESPColor",
+    Callback = function(c) print(c) end })
+
+local bar = Main:CreateProgressBar({ Name = "Quest Progress", Max = 10, Value = 3 })
+Main:CreateDivider()
+Main:CreateButton({ Name = "Rejoin", Description = "เข้าเซิร์ฟเวอร์ใหม่", Callback = function()
+    Window:Dialog({ Title = "Rejoin?", Content = "ต้องการเข้าเซิร์ฟเวอร์ใหม่ไหม", Buttons = {
+        { Name = "Yes", Callback = function() game:GetService("TeleportService"):Teleport(game.PlaceId) end },
+        { Name = "No" },
+    }})
+end })
+
+SilL:Notify({ Title = "Loaded", Content = "พร้อมใช้งานแล้ว!", Type = "Success", Duration = 5 })
+Window:LoadConfig() -- เรียกบรรทัดนี้หลังสร้าง element ครบทุกตัว
