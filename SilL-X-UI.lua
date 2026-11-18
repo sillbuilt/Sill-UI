@@ -1,6 +1,10 @@
 --[[
-    SilL UI v2.0.0
-    - Runtime themes, search, collapsible sections, tooltips, dialogs
+    SILL X UI v3.0.0 (X Edition)
+    - 20 Built-in Themes (Default, Midnight, Ocean, Rose, Emerald, Light, Ruby, Gold,
+      Amethyst, Cyberpunk, Hacker, Aqua, Sunset, Sakura, Dracula, Nord, BloodMoon,
+      Matcha, Synthwave, Monochrome)
+    - Live Watermark (FPS / Ping / Clock) with toggle in Settings
+    - Topbar Accent Glow Line, Runtime themes, search, collapsible sections, tooltips, dialogs
     - Config profiles + auto save, built-in Settings tab
     - Resizable window, mobile toggle button, notification stack
 ]]
@@ -19,7 +23,7 @@ local MB1, TOUCH, MOVE = Enum.UserInputType.MouseButton1, Enum.UserInputType.Tou
 local AUTO_Y, AUTO_X = Enum.AutomaticSize.Y, Enum.AutomaticSize.X
 
 local SilL = {
-    Version = "2.0.0",
+    Version = "X 3.0.0",
     Flags = {},
     Themes = {},
     CurrentThemeName = "Default",
@@ -51,7 +55,22 @@ SilL.Themes.Midnight = Derive{Background=RGB(14,14,20), Topbar=RGB(10,10,15), Si
 SilL.Themes.Ocean    = Derive{Background=RGB(16,26,36), Topbar=RGB(12,20,28), Sidebar=RGB(20,32,44), Panel=RGB(14,22,31), Element=RGB(26,40,54), ElementHover=RGB(34,52,70), Stroke=RGB(44,64,84), Accent=RGB(0,170,220), AccentDim=RGB(0,130,175)}
 SilL.Themes.Rose     = Derive{Background=RGB(32,24,30), Topbar=RGB(26,19,24), Sidebar=RGB(38,28,35), Panel=RGB(28,21,26), Element=RGB(48,35,44), ElementHover=RGB(62,45,57), Stroke=RGB(78,56,70), Accent=RGB(240,98,146), AccentDim=RGB(200,72,118)}
 SilL.Themes.Emerald  = Derive{Background=RGB(20,30,26), Topbar=RGB(15,23,20), Sidebar=RGB(24,36,31), Panel=RGB(17,26,22), Element=RGB(30,45,38), ElementHover=RGB(40,58,50), Stroke=RGB(52,74,64), Accent=RGB(46,204,113), AccentDim=RGB(36,160,90)}
-SilL.Themes.Light    = Derive{Text=RGB(30,30,38), TextDim=RGB(110,110,125), Background=RGB(244,245,250), Topbar=RGB(232,234,242), Sidebar=RGB(236,238,245), Panel=RGB(226,228,238), Element=RGB(255,255,255), ElementHover=RGB(240,242,250), Stroke=RGB(208,210,222), Accent=RGB(80,110,245), AccentDim=RGB(60,90,210)}
+SilL.Themes.Light      = Derive{Text=RGB(30,30,38), TextDim=RGB(110,110,125), Background=RGB(244,245,250), Topbar=RGB(232,234,242), Sidebar=RGB(236,238,245), Panel=RGB(226,228,238), Element=RGB(255,255,255), ElementHover=RGB(240,242,250), Stroke=RGB(208,210,222), Accent=RGB(80,110,245), AccentDim=RGB(60,90,210)}
+SilL.Themes.Ruby       = Derive{Background=RGB(26,10,14), Topbar=RGB(20,8,12), Sidebar=RGB(32,12,18), Panel=RGB(22,10,14), Element=RGB(40,16,24), ElementHover=RGB(52,20,32), Stroke=RGB(60,24,38), Accent=RGB(220,50,70), AccentDim=RGB(180,40,55)}
+SilL.Themes.Gold       = Derive{Background=RGB(25,22,16), Topbar=RGB(18,16,12), Sidebar=RGB(30,26,19), Panel=RGB(22,19,14), Element=RGB(42,36,26), ElementHover=RGB(55,48,35), Stroke=RGB(75,65,45), Accent=RGB(255,200,40), AccentDim=RGB(210,160,25), AccentText=RGB(20,18,12)}
+SilL.Themes.Amethyst   = Derive{Background=RGB(20,15,28), Topbar=RGB(15,10,22), Sidebar=RGB(25,19,35), Panel=RGB(18,13,25), Element=RGB(35,26,48), ElementHover=RGB(46,35,62), Stroke=RGB(62,48,84), Accent=RGB(168,108,240), AccentDim=RGB(130,80,195)}
+SilL.Themes.Cyberpunk  = Derive{Background=RGB(14,14,24), Topbar=RGB(10,10,18), Sidebar=RGB(18,18,32), Panel=RGB(12,12,22), Element=RGB(26,26,45), ElementHover=RGB(36,36,60), Stroke=RGB(0,220,255), Accent=RGB(255,0,160), AccentDim=RGB(200,0,125), Text=RGB(235,250,255), TextDim=RGB(120,190,210)}
+SilL.Themes.Hacker     = Derive{Background=RGB(10,14,10), Topbar=RGB(6,9,6), Sidebar=RGB(12,18,12), Panel=RGB(8,12,8), Element=RGB(16,26,16), ElementHover=RGB(22,36,22), Stroke=RGB(20,90,30), Accent=RGB(0,240,80), AccentDim=RGB(0,180,60), AccentText=RGB(8,14,8), Text=RGB(200,255,210), TextDim=RGB(100,165,110)}
+SilL.Themes.Aqua       = Derive{Background=RGB(12,24,28), Topbar=RGB(9,18,22), Sidebar=RGB(15,30,35), Panel=RGB(11,21,25), Element=RGB(20,38,45), ElementHover=RGB(28,50,58), Stroke=RGB(38,68,78), Accent=RGB(0,230,195), AccentDim=RGB(0,180,155), AccentText=RGB(10,22,25)}
+SilL.Themes.Sunset     = Derive{Background=RGB(30,18,22), Topbar=RGB(23,14,17), Sidebar=RGB(36,22,26), Panel=RGB(26,16,19), Element=RGB(46,28,33), ElementHover=RGB(58,36,42), Stroke=RGB(75,46,52), Accent=RGB(255,110,75), AccentDim=RGB(210,85,55)}
+-- 7 Extra Custom Themes
+SilL.Themes.Sakura     = Derive{Background=RGB(32,22,28), Topbar=RGB(25,17,22), Sidebar=RGB(38,26,33), Panel=RGB(28,19,25), Element=RGB(48,34,43), ElementHover=RGB(60,43,54), Stroke=RGB(82,58,72), Accent=RGB(255,160,195), AccentDim=RGB(215,125,160), AccentText=RGB(32,18,25), Text=RGB(255,240,246), TextDim=RGB(190,155,170)}
+SilL.Themes.Dracula    = Derive{Background=RGB(40,42,54), Topbar=RGB(30,31,41), Sidebar=RGB(35,37,48), Panel=RGB(33,35,45), Element=RGB(52,55,70), ElementHover=RGB(68,71,90), Stroke=RGB(82,86,110), Accent=RGB(189,147,249), AccentDim=RGB(149,110,210), AccentText=RGB(25,26,34), Text=RGB(248,248,242), TextDim=RGB(145,152,185)}
+SilL.Themes.Nord       = Derive{Background=RGB(46,52,64), Topbar=RGB(36,41,51), Sidebar=RGB(52,59,73), Panel=RGB(41,47,58), Element=RGB(59,66,82), ElementHover=RGB(67,76,94), Stroke=RGB(76,86,106), Accent=RGB(136,192,208), AccentDim=RGB(94,129,172), AccentText=RGB(36,41,51), Text=RGB(236,239,244), TextDim=RGB(165,175,192)}
+SilL.Themes.BloodMoon  = Derive{Background=RGB(16,10,12), Topbar=RGB(11,7,8), Sidebar=RGB(21,12,15), Panel=RGB(14,8,10), Element=RGB(30,15,19), ElementHover=RGB(42,20,26), Stroke=RGB(65,22,30), Accent=RGB(210,25,45), AccentDim=RGB(160,18,32), Text=RGB(245,230,232), TextDim=RGB(165,130,136)}
+SilL.Themes.Matcha     = Derive{Background=RGB(24,28,22), Topbar=RGB(18,22,17), Sidebar=RGB(29,34,27), Panel=RGB(21,25,19), Element=RGB(36,43,33), ElementHover=RGB(46,55,42), Stroke=RGB(60,72,55), Accent=RGB(135,195,105), AccentDim=RGB(105,155,80), AccentText=RGB(20,25,18), Text=RGB(238,244,234), TextDim=RGB(155,170,148)}
+SilL.Themes.Synthwave  = Derive{Background=RGB(26,16,38), Topbar=RGB(19,11,28), Sidebar=RGB(32,20,46), Panel=RGB(22,13,33), Element=RGB(42,26,60), ElementHover=RGB(55,34,78), Stroke=RGB(95,45,135), Accent=RGB(255,65,180), AccentDim=RGB(205,45,145), Text=RGB(250,235,255), TextDim=RGB(185,145,210)}
+SilL.Themes.Monochrome = Derive{Background=RGB(16,16,16), Topbar=RGB(10,10,10), Sidebar=RGB(20,20,20), Panel=RGB(13,13,13), Element=RGB(28,28,28), ElementHover=RGB(38,38,38), Stroke=RGB(58,58,58), Accent=RGB(245,245,245), AccentDim=RGB(190,190,190), AccentText=RGB(12,12,12), Text=RGB(245,245,245), TextDim=RGB(145,145,145)}
 
 local Theme = SilL.Themes.Default
 
@@ -99,7 +118,7 @@ end
 local function SafeCall(fn, ...)
     if typeof(fn) ~= "function" then return end
     local ok, err = pcall(fn, ...)
-    if not ok then warn("[SilL] Callback error: " .. tostring(err)) end
+    if not ok then warn("[SILL X] Callback error: " .. tostring(err)) end
 end
 local function Fire(fn, ...) task.spawn(SafeCall, fn, ...) end
 
@@ -199,7 +218,7 @@ end
 --==================== THEME API ====================--
 function SilL:SetTheme(t)
     if type(t) == "string" then
-        if not SilL.Themes[t] then warn("[SilL] Unknown theme: " .. t) return end
+        if not SilL.Themes[t] then warn("[SILL X] Unknown theme: " .. t) return end
         Theme = SilL.Themes[t]
         SilL.CurrentThemeName = t
     elseif type(t) == "table" then
@@ -222,7 +241,7 @@ function SilL:AddTheme(name, tbl) SilL.Themes[name] = Derive(tbl) end
 local NotifyHolder
 local function GetNotifyHolder()
     if NotifyHolder and NotifyHolder.Parent then return NotifyHolder end
-    local gui = MakeScreenGui("SilL_Notify")
+    local gui = MakeScreenGui("SILL_X_Notify")
     NotifyHolder = New("Frame", {
         AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
         Size = UDim2.new(0, 300, 1, -32), BackgroundTransparency = 1, Parent = gui,
@@ -280,7 +299,7 @@ function SilL:CreateWindow(opts)
     if opts.Theme then SilL:SetTheme(opts.Theme) end
 
     local Window = {
-        Name = opts.Name or "SilL UI",
+        Name = opts.Name or "SILL X UI",
         Tabs = {},
         CurrentTab = nil,
         Visible = true,
@@ -298,7 +317,7 @@ function SilL:CreateWindow(opts)
     local sidebarW = opts.SidebarWidth or 160
 
     local config = opts.Config or opts.ConfigurationSaving or {}
-    config.Folder = config.Folder or "SilL"
+    config.Folder = config.Folder or "SILL_X"
     config.FileName = config.FileName or "default"
     local configEnabled = (config.Enabled == true) and FS.Available()
     Window._autoSave = config.AutoSave == true
@@ -306,7 +325,7 @@ function SilL:CreateWindow(opts)
     local cam = workspace.CurrentCamera
     local baseScale = opts.Scale or ((UIS.TouchEnabled and cam and cam.ViewportSize.X < 900) and 0.75 or 1)
 
-    local gui = MakeScreenGui("SilL_" .. HttpService:GenerateGUID(false):sub(1, 8))
+    local gui = MakeScreenGui("SILL_X_" .. HttpService:GenerateGUID(false):sub(1, 8))
     Window.Gui = gui
 
     -- Main frame
@@ -320,7 +339,7 @@ function SilL:CreateWindow(opts)
     -- Topbar
     local Topbar = New("Frame", {Size = UDim2.new(1, 0, 0, 42), Theme = {BackgroundColor3 = "Topbar"}, Parent = Main}, {Corner(10)})
     New("Frame", {Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10), Theme = {BackgroundColor3 = "Topbar"}, Parent = Topbar})
-    New("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, 0), Theme = {BackgroundColor3 = "Stroke"}, Parent = Topbar})
+    New("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, 0), Theme = {BackgroundColor3 = "Accent"}, BackgroundTransparency = 0.35, Parent = Topbar})
     Text({Text = Window.Name, Font = Enum.Font.GothamBold, TextSize = 14, Size = UDim2.new(1, -120, 0, 16), Position = UDim2.fromOffset(14, 6), Parent = Topbar})
     Text({Text = subtitle, Font = Enum.Font.Gotham, TextSize = 11, Theme = {TextColor3 = "TextDim"}, Size = UDim2.new(1, -120, 0, 14), Position = UDim2.fromOffset(14, 22), Parent = Topbar})
 
@@ -1281,8 +1300,35 @@ function SilL:CreateWindow(opts)
         local names = {}
         for n in pairs(SilL.Themes) do table.insert(names, n) end
         table.sort(names)
-        ui:CreateDropdown({Name = "Theme", Options = names, CurrentOption = SilL.CurrentThemeName, Callback = function(v)
+        local themeDropdown = ui:CreateDropdown({Name = "Theme (" .. #names .. " Available)", Options = names, CurrentOption = SilL.CurrentThemeName, Callback = function(v)
             if v then SilL:SetTheme(v) end
+        end})
+        ui:CreateButton({Name = "Random Theme", Description = "Pick a surprise theme from all " .. #names .. " styles", Callback = function()
+            local pick = names[math.random(1, #names)]
+            themeDropdown:Set(pick)
+            SilL:Notify({Title = "SILL X Theme", Content = "Switched to " .. pick .. " theme!", Type = "Info", Duration = 2.5})
+        end})
+
+        -- Live Watermark Pill
+        local wmFrame = New("Frame", {
+            Visible = opts.Watermark ~= false, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, 0, 12),
+            Size = UDim2.fromOffset(0, 28), AutomaticSize = AUTO_X, Theme = {BackgroundColor3 = "Topbar"}, Parent = gui
+        }, {Corner(6), Stroke("Accent"), Pad(0, 0, 10, 10)})
+        MakeDraggable(wmFrame, wmFrame)
+        local wmLabel = Text({Text = Window.Name .. " | 60 FPS", Font = Enum.Font.GothamMedium, TextSize = 12, Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AUTO_X, Parent = wmFrame})
+        local fpsAcc, fpsFrames = 0, 0
+        Connect(RunService.RenderStepped, function(dt)
+            if not wmFrame.Visible then return end
+            fpsAcc += dt
+            fpsFrames += 1
+            if fpsAcc >= 0.5 then
+                local fps = math.floor(fpsFrames / fpsAcc + 0.5)
+                fpsAcc, fpsFrames = 0, 0
+                wmLabel.Text = string.format("%s  •  %d FPS  •  %s", Window.Name, fps, os.date("%H:%M:%S"))
+            end
+        end)
+        ui:CreateToggle({Name = "Show Watermark", Description = "Display floating SILL X status bar (draggable)", CurrentValue = opts.Watermark ~= false, Callback = function(v)
+            wmFrame.Visible = v
         end})
         ui:CreateKeybind({Name = "Toggle UI Key", CurrentKeybind = Window.ToggleKey.Name, CallbackKeyChange = function(k)
             Window:SetToggleKey(k)
