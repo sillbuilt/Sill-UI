@@ -566,10 +566,10 @@ local function worldPass()
 end
 
 --------------------------------------------------------------------------------
--- INIT: UI (SilL UI Integration - Fixed)
+-- INIT: UI (SilL X UI Integration)
 --------------------------------------------------------------------------------
 
-local UI_URL = "https://raw.githubusercontent.com/sillbuilt/Sill-UI/refs/heads/main/SilL-UI.lua?t=" .. tostring(os.time()) .. math.random(1, 1000)
+local UI_URL = "https://raw.githubusercontent.com/sillbuilt/Sill-UI/refs/heads/main/SilL-X-UI.lua?t=" .. tostring(os.time()) .. math.random(1, 1000)
 local success, SilL = pcall(function() return loadstring(game:HttpGet(UI_URL))() end)
 
 local win
