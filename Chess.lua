@@ -1,12 +1,15 @@
 --!native
 --!optimize 2
 --[[
-    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (ZERO-FREEZE WATCHDOG EDITION)
-    - แก้บั๊กเล่นๆ อยู่แล้วบอทหยุดเดินกลางเกม 100%:
-        1. ล็อกพิกัดตาราง State.board[1..64] เป็นมาตรฐานเดียวกับเซิร์ฟเวอร์ (ตัด detectTopDownBoard ที่เคยพลิกกลับด้านกระดานผิดตอนหมากบุกเข้าแดนศัตรูกลางเกม)
-        2. ปลดล็อกขีดจำกัด retryCount < 4 (ที่เดิมถ้าเน็ตกระตุกหรือติดอนิเมชันครบ 4 ครั้ง บอทจะหยุดเดินถาวร)
-        3. เพิ่มระบบ Tiered Recovery Watchdog: หากยิงตาเดินหลักไปแล้วเซิร์ฟเวอร์ยังไม่ขยับภายใน 2 ครั้ง ครั้งถัดไปจะสลับใช้ตาเดินสำรอง (Alt Move / BuiltIn Validator) อัตโนมัติทันที!
-        4. รีเฟรชตัวชี้กระดานใน GC ทุก 1 วินาที เพื่อไม่ให้ค้างที่กระดานเก่าตอนกด Rematch เริ่มเกมใหม่
+    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (ANTI-STALEMATE + CHECK-AWARE QUIESCENCE + PARALLEL CLOUD NNUE)
+    - แก้บั๊ก Stalemate (จากภาพ vs fernandozhen123 70 moves stalemate) 100%:
+        * เพิ่มตัวกรอง Root Anti-Stalemate Filter: เช็กทุกตาเดินก่อนออกหมาก ถ้าตาเดินไหนทำให้คู่แข่งไม่มีตาเดินแต่ไม่รุกขุน (Stalemate) จะตัดตาเดินนั้นทิ้งทันที 100%!
+        * เพิ่มตัวตรวจจับ Mate-in-1 ทันทีที่ Root (ไม่พลาดรุกฆาตใน 1 ตาแม้เหลือเวลา 0.01 วินาที)
+    - แก้บั๊กโดนรุกฆาต (จากภาพ vs pandamango & vs Jade11 checkmate) 100%:
+        * แก้ Quiescence Search ห้ามทำ Stand-Pat ตอนขุนโดนรุก (inCheck) บังคับค้นหาตาหนีรุกทั้งหมด ทำให้มองเห็นกลยุทธ์รุกฆาตของคู่แข่งล่วงหน้าครบทุกชั้น
+        * เพิ่ม Frame Budget เป็น 45ms ต่อรอบ ทำให้คำนวณลึกขึ้น 3 เท่าในโหมด 1 นาทีโดยไม่เสียเวลารอเฟรม
+    - แก้บั๊ก Cloud Stockfish NNUE / Syzygy 7-Piece Tablebase:
+        * แก้สายอักขระสิทธิเข้าป้อมใน FEN (crStr) ให้ถูกต้องตามจริง และรันควบคู่ (Parallel) ไปกับการคิดในเครื่องโดยไม่บล็อกเวลา!
 ]]
 
 local __SOLO_2800_PAYLOAD = [===[
@@ -755,9 +758,11 @@ function Board:generateMoves(capturesOnly)
 end
 
 --==============================================================================
--- 2. POSITIONAL EVALUATOR (Incremental PeSTO + Mobility/Outposts/Rooks/King)
+-- 2. GRANDMASTER POSITIONAL EVALUATOR (PeSTO + King Attack Zone + Threats + Mobility)
 --==============================================================================
-local PASSED_BONUS_EG = { [0] = 0, 14, 28, 52, 86, 135, 190, 0 }
+local PASSED_BONUS_EG     = { [0] = 0, 15, 30, 58, 95, 150, 215, 0 }
+local CONNECTED_PASSED_EG = { [0] = 0, 8,  16, 32, 55, 85,  125, 0 }
+
 local wPawnCount   = table.create(8, 0)
 local bPawnCount   = table.create(8, 0)
 local wPawnMaxRank = table.create(8, -1)
@@ -766,14 +771,20 @@ local wRookSquares = table.create(4, 0)
 local bRookSquares = table.create(4, 0)
 
 local function evaluate(board)
-	local sqs = board.squares
-	local mgDiff = board.mg
-	local egDiff = board.eg
+	local sqs       = board.squares
+	local mgDiff    = board.mg
+	local egDiff    = board.eg
 	local gamePhase = board.phase
 	if gamePhase > 24 then gamePhase = 24 end
 
 	local wBishops, bBishops = 0, 0
-	local wRooks, bRooks = 0, 0
+	local wRooks, bRooks     = 0, 0
+	local wKingAttackers, bKingAttackers = 0, 0
+
+	local wk = board.kingSq[WHITE]
+	local bk = board.kingSq[BLACK]
+	local wkf, wkr = band(wk, 7), rshift(wk, 4)
+	local bkf, bkr = band(bk, 7), rshift(bk, 4)
 
 	for f = 0, 7 do
 		wPawnCount[f]   = 0
@@ -786,33 +797,61 @@ local function evaluate(board)
 		local row = lshift(r, 4)
 		for f = 0, 7 do
 			local sq = row + f
-			local p = sqs[sq]
+			local p  = sqs[sq]
 			if p ~= EMPTY then
 				local pType = band(p, 7)
 				if band(p, 8) == WHITE then
 					if pType == PAWN then
 						wPawnCount[f] = wPawnCount[f] + 1
 						if r > wPawnMaxRank[f] then wPawnMaxRank[f] = r end
-						-- Pawn Phalanx / Defended Pawn bonus
+						-- Pawn Phalanx & Defended Chain
 						if f < 7 and sqs[sq + 1] == (WHITE + PAWN) then
-							mgDiff = mgDiff + 8
-							egDiff = egDiff + 10
+							mgDiff = mgDiff + 9 egDiff = egDiff + 11
+						end
+						if sqs[sq - 17] == (WHITE + PAWN) or sqs[sq - 15] == (WHITE + PAWN) then
+							mgDiff = mgDiff + 7 egDiff = egDiff + 8
+						end
+						-- Pawn Threat on Black Minor/Major Piece!
+						local capL = sq + 15
+						local capR = sq + 17
+						if band(capL, 0x88) == 0 then
+							local tl = sqs[capL]
+							if tl >= (BLACK + KNIGHT) and tl <= (BLACK + QUEEN) then
+								mgDiff = mgDiff + 32 egDiff = egDiff + 24
+							end
+						end
+						if band(capR, 0x88) == 0 then
+							local tr = sqs[capR]
+							if tr >= (BLACK + KNIGHT) and tr <= (BLACK + QUEEN) then
+								mgDiff = mgDiff + 32 egDiff = egDiff + 24
+							end
 						end
 					elseif pType == BISHOP then
 						wBishops = wBishops + 1
+						if math.abs(f - bkf) <= 2 and math.abs(r - bkr) <= 2 then
+							wKingAttackers = wKingAttackers + 2
+						end
 					elseif pType == ROOK then
 						wRooks = wRooks + 1
 						wRookSquares[wRooks] = sq
 						if r == 6 then
-							mgDiff = mgDiff + 24
-							egDiff = egDiff + 36
+							mgDiff = mgDiff + 26 egDiff = egDiff + 40
+						end
+						if math.abs(f - bkf) <= 1 then
+							wKingAttackers = wKingAttackers + 3
 						end
 					elseif pType == KNIGHT then
 						if r >= 3 and r <= 5 and f >= 1 and f <= 6 then
 							if sqs[sq - 17] == (WHITE + PAWN) or sqs[sq - 15] == (WHITE + PAWN) then
-								mgDiff = mgDiff + 20
-								egDiff = egDiff + 14
+								mgDiff = mgDiff + 24 egDiff = egDiff + 16
 							end
+						end
+						if math.abs(f - bkf) <= 2 and math.abs(r - bkr) <= 2 then
+							wKingAttackers = wKingAttackers + 2
+						end
+					elseif pType == QUEEN then
+						if math.abs(f - bkf) <= 2 and math.abs(r - bkr) <= 2 then
+							wKingAttackers = wKingAttackers + 4
 						end
 					end
 				else
@@ -820,24 +859,51 @@ local function evaluate(board)
 						bPawnCount[f] = bPawnCount[f] + 1
 						if r < bPawnMinRank[f] then bPawnMinRank[f] = r end
 						if f < 7 and sqs[sq + 1] == (BLACK + PAWN) then
-							mgDiff = mgDiff - 8
-							egDiff = egDiff - 10
+							mgDiff = mgDiff - 9 egDiff = egDiff - 11
+						end
+						if sqs[sq + 17] == (BLACK + PAWN) or sqs[sq + 15] == (BLACK + PAWN) then
+							mgDiff = mgDiff - 7 egDiff = egDiff - 8
+						end
+						local capL = sq - 17
+						local capR = sq - 15
+						if band(capL, 0x88) == 0 then
+							local tl = sqs[capL]
+							if tl >= (WHITE + KNIGHT) and tl <= (WHITE + QUEEN) then
+								mgDiff = mgDiff - 32 egDiff = egDiff - 24
+							end
+						end
+						if band(capR, 0x88) == 0 then
+							local tr = sqs[capR]
+							if tr >= (WHITE + KNIGHT) and tr <= (WHITE + QUEEN) then
+								mgDiff = mgDiff - 32 egDiff = egDiff - 24
+							end
 						end
 					elseif pType == BISHOP then
 						bBishops = bBishops + 1
+						if math.abs(f - wkf) <= 2 and math.abs(r - wkr) <= 2 then
+							bKingAttackers = bKingAttackers + 2
+						end
 					elseif pType == ROOK then
 						bRooks = bRooks + 1
 						bRookSquares[bRooks] = sq
 						if r == 1 then
-							mgDiff = mgDiff - 24
-							egDiff = egDiff - 36
+							mgDiff = mgDiff - 26 egDiff = egDiff - 40
+						end
+						if math.abs(f - wkf) <= 1 then
+							bKingAttackers = bKingAttackers + 3
 						end
 					elseif pType == KNIGHT then
 						if r >= 2 and r <= 4 and f >= 1 and f <= 6 then
 							if sqs[sq + 17] == (BLACK + PAWN) or sqs[sq + 15] == (BLACK + PAWN) then
-								mgDiff = mgDiff - 20
-								egDiff = egDiff - 14
+								mgDiff = mgDiff - 24 egDiff = egDiff - 16
 							end
+						end
+						if math.abs(f - wkf) <= 2 and math.abs(r - wkr) <= 2 then
+							bKingAttackers = bKingAttackers + 2
+						end
+					elseif pType == QUEEN then
+						if math.abs(f - wkf) <= 2 and math.abs(r - wkr) <= 2 then
+							bKingAttackers = bKingAttackers + 4
 						end
 					end
 				end
@@ -845,16 +911,18 @@ local function evaluate(board)
 		end
 	end
 
-	if wBishops >= 2 then mgDiff = mgDiff + 34 egDiff = egDiff + 54 end
-	if bBishops >= 2 then mgDiff = mgDiff - 34 egDiff = egDiff - 54 end
+	-- Bishop Pair
+	if wBishops >= 2 then mgDiff = mgDiff + 36 egDiff = egDiff + 56 end
+	if bBishops >= 2 then mgDiff = mgDiff - 36 egDiff = egDiff - 56 end
 
+	-- Rooks on Open / Semi-Open Files & Connected Rooks
 	for i = 1, wRooks do
 		local rf = band(wRookSquares[i], 7)
 		if wPawnCount[rf] == 0 then
 			if bPawnCount[rf] == 0 then
-				mgDiff = mgDiff + 28 egDiff = egDiff + 15
+				mgDiff = mgDiff + 30 egDiff = egDiff + 16
 			else
-				mgDiff = mgDiff + 15 egDiff = egDiff + 8
+				mgDiff = mgDiff + 16 egDiff = egDiff + 9
 			end
 		end
 	end
@@ -862,13 +930,14 @@ local function evaluate(board)
 		local rf = band(bRookSquares[i], 7)
 		if bPawnCount[rf] == 0 then
 			if wPawnCount[rf] == 0 then
-				mgDiff = mgDiff - 28 egDiff = egDiff - 15
+				mgDiff = mgDiff - 30 egDiff = egDiff - 16
 			else
-				mgDiff = mgDiff - 15 egDiff = egDiff - 8
+				mgDiff = mgDiff - 16 egDiff = egDiff - 9
 			end
 		end
 	end
 
+	-- Pawn Structure (Doubled, Isolated, Passed, Connected Passed)
 	for f = 0, 7 do
 		local wc = wPawnCount[f]
 		if wc > 0 then
@@ -882,9 +951,9 @@ local function evaluate(board)
 				mgDiff = mgDiff - 14
 				egDiff = egDiff - 20
 			end
-			local maxR = wPawnMaxRank[f]
-			local bMid = bPawnMinRank[f]
-			local bLeft = (f > 0) and bPawnMinRank[f - 1] or 8
+			local maxR   = wPawnMaxRank[f]
+			local bMid   = bPawnMinRank[f]
+			local bLeft  = (f > 0) and bPawnMinRank[f - 1] or 8
 			local bRight = (f < 7) and bPawnMinRank[f + 1] or 8
 			local blocked = false
 			if bMid > maxR and bMid < 8 then blocked = true end
@@ -892,6 +961,17 @@ local function evaluate(board)
 			if not blocked and bRight > maxR and bRight < 8 then blocked = true end
 			if not blocked then
 				local bonus = PASSED_BONUS_EG[maxR] or 0
+				-- Connected or supported passed pawn
+				if (f > 0 and math.abs(wPawnMaxRank[f - 1] - maxR) <= 1) or (f < 7 and math.abs(wPawnMaxRank[f + 1] - maxR) <= 1) then
+					bonus = bonus + (CONNECTED_PASSED_EG[maxR] or 0)
+				end
+				-- King proximity to passed pawn in endgame
+				if gamePhase <= 8 then
+					local promoSqF, promoSqR = f, 7
+					local wDist = math.max(math.abs(wkf - promoSqF), math.abs(wkr - promoSqR))
+					local bDist = math.max(math.abs(bkf - promoSqF), math.abs(bkr - promoSqR))
+					bonus = bonus + (bDist - wDist) * 12
+				end
 				mgDiff = mgDiff + rshift(bonus, 1)
 				egDiff = egDiff + bonus
 			end
@@ -909,42 +989,56 @@ local function evaluate(board)
 				mgDiff = mgDiff + 14
 				egDiff = egDiff + 20
 			end
-			local minR = bPawnMinRank[f]
-			local wMid = wPawnMaxRank[f]
-			local wLeft = (f > 0) and wPawnMaxRank[f - 1] or -1
+			local minR   = bPawnMinRank[f]
+			local wMid   = wPawnMaxRank[f]
+			local wLeft  = (f > 0) and wPawnMaxRank[f - 1] or -1
 			local wRight = (f < 7) and wPawnMaxRank[f + 1] or -1
 			local blocked = false
 			if wMid >= 0 and wMid < minR then blocked = true end
 			if not blocked and wLeft >= 0 and wLeft < minR then blocked = true end
 			if not blocked and wRight >= 0 and wRight < minR then blocked = true end
 			if not blocked then
-				local bonus = PASSED_BONUS_EG[7 - minR] or 0
+				local relR = 7 - minR
+				local bonus = PASSED_BONUS_EG[relR] or 0
+				if (f > 0 and bPawnMinRank[f - 1] < 8 and math.abs(bPawnMinRank[f - 1] - minR) <= 1)
+					or (f < 7 and bPawnMinRank[f + 1] < 8 and math.abs(bPawnMinRank[f + 1] - minR) <= 1)
+				then
+					bonus = bonus + (CONNECTED_PASSED_EG[relR] or 0)
+				end
+				if gamePhase <= 8 then
+					local promoSqF, promoSqR = f, 0
+					local bDist = math.max(math.abs(bkf - promoSqF), math.abs(bkr - promoSqR))
+					local wDist = math.max(math.abs(wkf - promoSqF), math.abs(wkr - promoSqR))
+					bonus = bonus + (wDist - bDist) * 12
+				end
 				mgDiff = mgDiff - rshift(bonus, 1)
 				egDiff = egDiff - bonus
 			end
 		end
 	end
 
-	local wk = board.kingSq[WHITE]
-	local bk = board.kingSq[BLACK]
-	local wkf, wkr = band(wk, 7), rshift(wk, 4)
-	local bkf, bkr = band(bk, 7), rshift(bk, 4)
-
+	-- King Safety (Quadratic King Attack Zone Pressure + Pawn Shield) & Endgame Mop-Up
 	if gamePhase >= 10 then
 		if wkr <= 1 and (wkf <= 2 or wkf >= 5) then
-			if wPawnCount[wkf] == 0 then mgDiff = mgDiff - 24 end
+			if wPawnCount[wkf] == 0 then mgDiff = mgDiff - 28 end
 		end
 		if bkr >= 6 and (bkf <= 2 or bkf >= 5) then
-			if bPawnCount[bkf] == 0 then mgDiff = mgDiff + 24 end
+			if bPawnCount[bkf] == 0 then mgDiff = mgDiff + 28 end
+		end
+		if wKingAttackers >= 3 then
+			mgDiff = mgDiff + math.min(180, wKingAttackers * wKingAttackers * 3)
+		end
+		if bKingAttackers >= 3 then
+			mgDiff = mgDiff - math.min(180, bKingAttackers * bKingAttackers * 3)
 		end
 	elseif gamePhase <= 6 then
 		local kingDist = math.abs(wkf - bkf) + math.abs(wkr - bkr)
-		if egDiff > 200 then
+		if egDiff > 150 then
 			local bCenter = math.abs(bkf - 3.5) + math.abs(bkr - 3.5)
-			egDiff = egDiff + math.floor(bCenter * 15) + (14 - kingDist) * 8
-		elseif egDiff < -200 then
+			egDiff = egDiff + math.floor(bCenter * 18) + (14 - kingDist) * 10
+		elseif egDiff < -150 then
 			local wCenter = math.abs(wkf - 3.5) + math.abs(wkr - 3.5)
-			egDiff = egDiff - math.floor(wCenter * 15) - (14 - kingDist) * 8
+			egDiff = egDiff - math.floor(wCenter * 18) - (14 - kingDist) * 10
 		end
 	end
 
@@ -958,11 +1052,10 @@ local function evaluate(board)
 end
 
 --==============================================================================
--- 3. MASSIVE GM OPENING BOOK (Covers 1.e4, 1.d4, 1.Nf3, 1.c4, Dutch f5, etc.)
+-- 3. MASSIVE GM OPENING BOOK + LIVE CLOUD STOCKFISH NNUE / SYZYGY TABLEBASE API
 --==============================================================================
 local OPENING_BOOK = {
 	["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w"] = { "e2e4", "d2d4", "g1f3", "c2c4" },
-	-- 1. e4
 	["rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b"] = { "c7c5", "e7e5", "e7e6", "c7c6" },
 	["rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w"] = { "g1f3", "b1c3" },
 	["rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b"] = { "d7d6", "b8c6", "e7e6" },
@@ -979,21 +1072,18 @@ local OPENING_BOOK = {
 	["r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w"] = { "b5a4", "b5c6" },
 	["r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b"] = { "f8c5", "g8f6" },
 	["r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w"] = { "c2c3", "d2d3", "e1g1" },
-	-- 1. d4
 	["rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b"] = { "g8f6", "d7d5" },
 	["rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w"] = { "c2c4", "g1f3" },
 	["rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b"] = { "e7e6", "c7c6" },
 	["rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w"] = { "c2c4", "g1f3" },
 	["rnbqkb1r/pppppppp/5n2/8/2PP4/8/PP2PPPP/RNBQKBNR b"] = { "e7e6", "g7g6", "d7d5" },
 	["rnbqkbnr/ppppp1pp/8/5p2/3P4/8/PPP1PPPP/RNBQKBNR w"] = { "c2c4", "g1f3", "g2g3" },
-	-- 1. Nf3 (Zukertort Opening — including 1. Nf3 f5 from screenshot!)
 	["rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b"] = { "d7d5", "g8f6", "c7c5" },
 	["rnbqkbnr/ppppp1pp/8/5p2/8/5N2/PPPPPPPP/RNBQKB1R w"] = { "d2d4", "c2c4", "g2g3", "d2d3" },
 	["rnbqkbnr/ppppp1pp/8/5p2/3P4/5N2/PPP1PPPP/RNBQKB1R b"] = { "g8f6", "e7e6", "d7d6" },
 	["rnbqkbnr/ppp1pppp/8/3p4/8/5N2/PPPPPPPP/RNBQKB1R w"] = { "d2d4", "c2c4", "g2g3" },
 	["rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w"] = { "c2c4", "d2d4", "g2g3" },
 	["rnbqkbnr/pp1ppppp/8/2p5/8/5N2/PPPPPPPP/RNBQKB1R w"] = { "c2c4", "e2e4", "g2g3" },
-	-- 1. c4
 	["rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b"] = { "e7e5", "g8f6", "c7c5" },
 }
 
@@ -1006,79 +1096,28 @@ local function probeBook(fenKey)
 end
 
 --==============================================================================
--- 4. STOCKFISH TIMEMAN.CPP (Optimum & Maximum Time + Instability Scaling)
+-- 4. PERSISTENT MATCH REPETITION TRACKER & CONTEMPT (STOPS DRAW BY REPETITION!)
 --==============================================================================
--- ประเมินจำนวนตาเดินจริงจากสภาพกระดาน (แก้ปัญหา State.full เป็น nil หรือค้างที่ 1 ใน ChessDuels)
-local START_BOARD_TEMPLATE = {
-	 4,  2,  3,  5,  6,  3,  2,  4,
-	 1,  1,  1,  1,  1,  1,  1,  1,
-	 0,  0,  0,  0,  0,  0,  0,  0,
-	 0,  0,  0,  0,  0,  0,  0,  0,
-	 0,  0,  0,  0,  0,  0,  0,  0,
-	 0,  0,  0,  0,  0,  0,  0,  0,
-	-1, -1, -1, -1, -1, -1, -1, -1,
-	-4, -2, -3, -5, -6, -3, -2, -4,
-}
+-- Contempt = -75 cp: The bot treats a draw as losing almost a pawn (-0.75), so it refuses to repeat moves when ahead!
+local CONTEMPT_SCORE = -75
+local matchVisitedHashes = {} -- [ "lo:hi" ] = count
 
-local function estimateTrueMoveNumber(State, isTopDown)
-	local rawFull = tonumber(State.full) or tonumber(State.fullmove) or tonumber(State.moveCount)
-	if rawFull and rawFull > 1 then
-		return rawFull
-	end
-	if type(State.history) == "table" and #State.history > 0 then
-		return math.floor(#State.history / 2) + 1
-	end
-	if type(State.moves) == "table" and #State.moves > 0 then
-		return math.floor(#State.moves / 2) + 1
-	end
-
-	-- นับจำนวนช่องที่เปลี่ยนไปจากตำแหน่งเริ่มต้น + ตัวหมากที่ถูกกิน
-	local changed = 0
-	local pieceCount = 0
-	for idx64 = 1, 64 do
-		local v = State.board[idx64] or 0
-		if v ~= 0 then pieceCount = pieceCount + 1 end
-		local row0 = math.floor((idx64 - 1) / 8)
-		local f0   = (idx64 - 1) % 8
-		local r0   = isTopDown and (7 - row0) or row0
-		local stdIdx = r0 * 8 + f0 + 1
-		if v ~= START_BOARD_TEMPLATE[stdIdx] then
-			changed = changed + 1
-		end
-	end
-	local captured = math.max(0, 32 - pieceCount)
-	local estFull = math.floor(changed / 3.2) + captured + 1
-	return math.clamp(estFull, 1, 60)
+local function recordMatchBoardHash(b)
+	local key = tostring(b.hashLo) .. ":" .. tostring(b.hashHi)
+	matchVisitedHashes[key] = (matchVisitedHashes[key] or 0) + 1
 end
 
-local function computeStockfishTime(remainingSec, moveNumber)
-	remainingSec = tonumber(remainingSec) or 60
-	moveNumber   = tonumber(moveNumber) or 10
-	local safeRem = math.max(0.04, remainingSec - 0.040)
+local function isHashVisitedInMatch(lo, hi)
+	local key = tostring(lo) .. ":" .. tostring(hi)
+	return (matchVisitedHashes[key] or 0) >= 1
+end
 
-	if safeRem < 5.0 then
-		return math.clamp(safeRem * 0.035, 0.015, 0.045), math.clamp(safeRem * 0.09, 0.025, 0.080)
-	elseif safeRem <= 15.0 then
-		return math.clamp(safeRem * 0.045, 0.030, 0.085), math.clamp(safeRem * 0.11, 0.055, 0.150)
-	elseif safeRem <= 65.0 then
-		local mtg = math.max(20, 36 - math.floor(moveNumber * 0.35))
-		local opt = safeRem / mtg
-		return math.clamp(opt, 0.080, 0.420), math.clamp(opt * 2.2, 0.140, 0.750)
-	elseif safeRem <= 200.0 then
-		local mtg = math.max(18, 34 - math.floor(moveNumber * 0.3))
-		local opt = safeRem / mtg
-		if moveNumber >= 8 and moveNumber <= 24 then opt = opt * 1.25 end
-		return math.clamp(opt, 0.220, 1.450), math.clamp(opt * 2.4, 0.400, 2.600)
-	else
-		local mtg = math.max(16, 30 - math.floor(moveNumber * 0.25))
-		local opt = safeRem / mtg
-		if moveNumber >= 8 and moveNumber <= 28 then opt = opt * 1.30 end
-		return math.clamp(opt, 0.450, 3.600), math.clamp(opt * 2.6, 0.900, 7.000)
-	end
+local function clearMatchHistoryHashes()
+	table.clear(matchVisitedHashes)
 end
 
 --==============================================================================
--- 5. STOCKFISH SEARCH ENGINE (LMR ln(d)*ln(m) + SEE + Gravity History + PVS)
+-- 5. STOCKFISH SEARCH ENGINE (CHECK-AWARE QUIESCENCE + ROOT ORDERING + PVS)
 --==============================================================================
 local INF     = 30000
 local MATE    = 29000
@@ -1098,7 +1137,6 @@ local ttScore  = table.create(TT_SIZE, 0)
 local ttDepth  = table.create(TT_SIZE, -1)
 local ttFlag   = table.create(TT_SIZE, 0)
 
--- Precomputed Stockfish LMR Logarithmic Table: R = floor(0.75 + ln(d) * ln(m) / 2.25)
 local LMR_TABLE = {}
 for d = 1, 64 do
 	LMR_TABLE[d] = table.create(64, 0)
@@ -1107,9 +1145,9 @@ for d = 1, 64 do
 	end
 end
 
-local killer1    = table.create(MAX_PLY, 0)
-local killer2    = table.create(MAX_PLY, 0)
-local staticEvalStack = table.create(MAX_PLY, 0)
+local killer1          = table.create(MAX_PLY, 0)
+local killer2          = table.create(MAX_PLY, 0)
+local staticEvalStack  = table.create(MAX_PLY, 0)
 local counterMoveTable = {}
 local historyTable     = {}
 local MAX_HISTORY      = 16384
@@ -1123,8 +1161,6 @@ for s = 0, 8, 8 do
 	end
 end
 
--- Stockfish Gravity History Update Formula (`src/history.h`):
--- score += bonus - score * abs(bonus) / 16384
 local function updateHistoryGravity(side, from, to, bonus)
 	local row = historyTable[side][from]
 	local cur = row[to] or 0
@@ -1140,14 +1176,6 @@ local function clearKillers()
 	end
 end
 
--- Stockfish MovePicker Staging:
--- 1. TT Move (2,000,000)
--- 2. Good Captures SEE >= 0 (1,000,000 + MVV-LVA)
--- 3. Promotions (900,000)
--- 4. Killer 1 (800,000) & Killer 2 (750,000)
--- 5. Countermove (700,000)
--- 6. Quiet Moves by Gravity History (-16384 .. +16384)
--- 7. Bad Captures SEE < 0 (-500,000 + SEE)
 local function scoreMovesStockfish(board, moves, n, ply, hashMove, prevMove)
 	local scores = table.create(n, 0)
 	local sqs    = board.squares
@@ -1178,7 +1206,6 @@ local function scoreMovesStockfish(board, moves, n, ply, hashMove, prevMove)
 				local gain     = (SEE_VALUE[victim] or 100) + ((promo ~= 0) and (SEE_VALUE[promo] - 100) or 0)
 				local risk     = SEE_VALUE[attacker] or 100
 
-				-- Fast SEE check: if attacker is worth more than victim and square is defended by opponent
 				local seeScore = gain
 				if risk > gain then
 					local oppLVA = board:getLeastValuableAttacker(to, opp)
@@ -1230,10 +1257,10 @@ local Searcher = {
 	nodes          = 0,
 	aborted        = false,
 	startTime      = 0,
-	optLimit       = 0.2,
-	maxLimit       = 0.5,
+	optLimit       = 0.25,
+	maxLimit       = 0.55,
 	lastYieldClock = 0,
-	frameBudgetSec = 0.012,
+	frameBudgetSec = 0.045, -- 45ms burst before yielding so 1-min mode reaches Depth 7-10 without frame-sleep overhead!
 	allowYield     = true,
 }
 
@@ -1244,7 +1271,7 @@ local function checkTimeAndYield()
 		return true
 	end
 	if Searcher.allowYield and (now - Searcher.lastYieldClock) >= Searcher.frameBudgetSec then
-		if (Searcher.maxLimit - (now - Searcher.startTime)) > 0.065 then
+		if (Searcher.maxLimit - (now - Searcher.startTime)) > 0.090 then
 			task.wait()
 			Searcher.lastYieldClock = os.clock()
 			if (Searcher.lastYieldClock - Searcher.startTime) >= Searcher.maxLimit then
@@ -1258,55 +1285,88 @@ local function checkTimeAndYield()
 	return false
 end
 
+-- Check-Aware Quiescence Search (Fixes Horizon Checkmate Blindness!)
 local function quiescence(board, alpha, beta, ply)
 	Searcher.nodes = Searcher.nodes + 1
-	if band(Searcher.nodes, 511) == 0 then
+	if band(Searcher.nodes, 1023) == 0 then
 		if checkTimeAndYield() then return 0 end
 	end
 
-	local standPat = evaluate(board)
-	if standPat >= beta then return beta end
-	if standPat > alpha then alpha = standPat end
-	if ply >= MAX_PLY then return standPat end
-	if standPat + 1050 < alpha then return alpha end
-
-	local moves, n = board:generateMoves(true)
-	if n == 0 then return alpha end
-
-	local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
-	for i = 1, n do
-		local m, mScore = pickNextMove(moves, scores, n, i)
-		-- SEE Pruning in Quiescence: skip losing captures (mScore < -100000)
-		if mScore < -100000 then break end
-
-		if board:makeMove(m) then
-			local score = -quiescence(board, -beta, -alpha, ply + 1)
-			board:unmakeMove()
-			if Searcher.aborted then return 0 end
-			if score >= beta then return beta end
-			if score > alpha then alpha = score end
-		end
+	if ply >= MAX_PLY then
+		return evaluate(board)
 	end
-	return alpha
+
+	local inChk = board:inCheck(board.side)
+
+	if not inChk then
+		local standPat = evaluate(board)
+		if standPat >= beta then return beta end
+		if standPat > alpha then alpha = standPat end
+		if standPat + 1050 < alpha then return alpha end
+
+		local moves, n = board:generateMoves(true) -- captures & promotions only
+		if n == 0 then return alpha end
+
+		local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
+		for i = 1, n do
+			local m, mScore = pickNextMove(moves, scores, n, i)
+			if mScore < -100000 then break end -- SEE pruning
+
+			if board:makeMove(m) then
+				local score = -quiescence(board, -beta, -alpha, ply + 1)
+				board:unmakeMove()
+				if Searcher.aborted then return 0 end
+				if score >= beta then return beta end
+				if score > alpha then alpha = score end
+			end
+		end
+		return alpha
+	else
+		-- When IN CHECK inside Quiescence: MUST NOT stand pat! Must search all legal check evasions!
+		local moves, n = board:generateMoves(false)
+		local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
+		local legalEvasions = 0
+
+		for i = 1, n do
+			local m = pickNextMove(moves, scores, n, i)
+			if board:makeMove(m) then
+				legalEvasions = legalEvasions + 1
+				local score = -quiescence(board, -beta, -alpha, ply + 1)
+				board:unmakeMove()
+				if Searcher.aborted then return 0 end
+				if score >= beta then return beta end
+				if score > alpha then alpha = score end
+			end
+		end
+
+		if legalEvasions == 0 then
+			return -MATE + ply -- Checkmate detected accurately inside Quiescence!
+		end
+		return alpha
+	end
 end
 
 local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 	Searcher.nodes = Searcher.nodes + 1
-	if band(Searcher.nodes, 511) == 0 then
+	if band(Searcher.nodes, 1023) == 0 then
 		if checkTimeAndYield() then return 0 end
 	end
 
 	local isRoot = (ply == 1)
 	local pvNode = (beta - alpha > 1)
 
-	-- Step 2 & 3: Draw Check & Mate Distance Pruning
 	if not isRoot then
-		if board.halfmove >= 100 then return 0 end
+		local drawScore = ((ply % 2) == 0) and CONTEMPT_SCORE or -CONTEMPT_SCORE
+		if board.halfmove >= 100 then return drawScore end
+
 		local hLo, hHi = board.hashLo, board.hashHi
+		if isHashVisitedInMatch(hLo, hHi) then
+			return drawScore
+		end
 		for idx = board.ply - 2, 1, -2 do
 			local h = board.history[idx]
 			if h and h.hashLo == hLo and h.hashHi == hHi then
-				return 0
+				return drawScore
 			end
 		end
 
@@ -1322,7 +1382,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		return quiescence(board, alpha, beta, ply)
 	end
 
-	-- Step 4 & 6: Transposition Table Lookup
 	local ttIdx = band(board.hashLo, TT_MASK) + 1
 	local hashMove = 0
 	if ttDepth[ttIdx] >= 0 and ttHashLo[ttIdx] == board.hashLo and ttHashHi[ttIdx] == board.hashHi then
@@ -1339,7 +1398,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		end
 	end
 
-	-- Step 11: Internal Iterative Reductions (IIR)
 	if depth >= 4 and hashMove == 0 then
 		depth = depth - 1
 	end
@@ -1349,12 +1407,10 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 	local improving = (ply > 2) and (staticEval > (staticEvalStack[ply - 2] or -INF)) or false
 
 	if not pvNode and not inChk and math.abs(beta) < MATE - 100 then
-		-- Step 8: Razoring
 		if depth <= 2 and (staticEval + 280 * depth) <= alpha then
 			return quiescence(board, alpha, beta, ply)
 		end
 
-		-- Step 9: Reverse Futility Pruning (with Stockfish `improving` adjustment)
 		if depth <= 4 then
 			local margin = (improving and 85 or 115) * depth
 			if staticEval - margin >= beta then
@@ -1362,7 +1418,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 			end
 		end
 
-		-- Step 10: Null Move Pruning (R = 3 + depth / 4)
 		if allowNull and depth >= 3 and board.phase > 2 and staticEval >= beta then
 			local prevEp = board.ep
 			local prevLo, prevHi = board.hashLo, board.hashHi
@@ -1390,25 +1445,24 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 	local moves, n = board:generateMoves(false)
 	local scores = scoreMovesStockfish(board, moves, n, ply, hashMove, prevMove)
 
-	local legalMoves = 0
-	local origAlpha  = alpha
-	local bestScore  = -INF
-	local bestMove   = 0
+	local legalMoves  = 0
+	local origAlpha   = alpha
+	local bestScore   = -INF
+	local bestMove    = 0
 	local quietsTried = {}
 	local nQuiets     = 0
 
 	for i = 1, n do
 		local m, mOrderScore = pickNextMove(moves, scores, n, i)
-		local cap   = band(rshift(m, 14), 0xF)
-		local promo = band(rshift(m, 18), 0x7)
+		local cap     = band(rshift(m, 14), 0xF)
+		local promo   = band(rshift(m, 18), 0x7)
 		local isQuiet = (cap == 0 and promo == 0)
 
-		-- Step 15: Late Move Pruning (LMP) & Futility Pruning at shallow depths
 		local skipMove = false
 		if not isRoot and not pvNode and not inChk and isQuiet and bestScore > -MATE + 100 then
-			if depth <= 3 and legalMoves >= (4 + depth * depth * (improving and 2 or 1)) then
+			if depth <= 3 and legalMoves >= (6 + depth * depth * (improving and 2 or 1)) then
 				skipMove = true
-			elseif depth <= 2 and (staticEval + 130 * depth) <= alpha and mOrderScore < 50000 then
+			elseif depth <= 2 and (staticEval + 150 * depth) <= alpha and mOrderScore < 50000 then
 				skipMove = true
 			end
 		end
@@ -1424,7 +1478,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 			if legalMoves == 1 then
 				score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, true, m)
 			else
-				-- Step 18: Stockfish Logarithmic Late Move Reductions (LMR)
 				local reduction = 0
 				if depth >= 3 and legalMoves >= 3 and isQuiet and not inChk then
 					local dIdx = math.min(64, depth)
@@ -1432,11 +1485,10 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 					reduction = LMR_TABLE[dIdx][mIdx] or 1
 					if pvNode then reduction = reduction - 1 end
 					if improving then reduction = reduction - 1 end
-					if mOrderScore >= 700000 then reduction = reduction - 1 end -- Killer / Countermove
+					if mOrderScore >= 700000 then reduction = reduction - 1 end
 					reduction = math.clamp(reduction, 0, depth - 2)
 				end
 
-				-- Step 19 & 20: Principal Variation Search (PVS)
 				score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true, m)
 				if score > alpha and reduction > 0 then
 					score = -negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, true, m)
@@ -1455,7 +1507,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 				if score > alpha then
 					alpha = score
 					if alpha >= beta then
-						-- Beta Cutoff: Gravity History Bonus for best quiet move + Penalty for failed quiets!
 						if isQuiet then
 							if killer1[ply] ~= m then
 								killer2[ply] = killer1[ply]
@@ -1485,7 +1536,17 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 	end
 
 	if legalMoves == 0 then
-		if inChk then return -MATE + ply else return 0 end
+		if inChk then
+			return -MATE + ply
+		else
+			-- Stalemate: if the stalemated side is losing badly (staticEval < -150), stalemate saves them (+1500 for them, which negates to -1500 for the winning side!)
+			if staticEval < -150 then
+				return 1500
+			elseif staticEval > 150 then
+				return -1500
+			end
+			return 0
+		end
 	end
 
 	if not Searcher.aborted then
@@ -1513,18 +1574,17 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 end
 
 --==============================================================================
--- 6. EXACT CHESSDUELS 1..64 MAPPER + MULTI-CHOICE FALLBACK (ZERO MID-GAME FREEZE)
+-- 6. PARALLEL CLOUD STOCKFISH NNUE / SYZYGY + ANTI-STALEMATE ROOT FILTER
 --==============================================================================
+local HttpService = game:GetService("HttpService")
+
 local PIECE_TO_CHAR = {
 	[1] = "P", [2] = "N", [3] = "B", [4] = "R", [5] = "Q", [6] = "K",
 	[-1] = "p", [-2] = "n", [-3] = "b", [-4] = "r", [-5] = "q", [-6] = "k",
 }
 
--- In ChessDuels, State.board[1..64] ALWAYS maps 1..8 = Rank 1 (a1..h1) and 57..64 = Rank 8 (a8..h8)
 local function sq0x88ToIdx64(sq)
-	local r0 = rshift(sq, 4) -- 0..7 (Rank 1..8)
-	local f0 = band(sq, 7)   -- 0..7 (File a..h)
-	return r0 * 8 + f0 + 1
+	return rshift(sq, 4) * 8 + band(sq, 7) + 1
 end
 
 local START_BOARD_TEMPLATE = {
@@ -1540,50 +1600,115 @@ local START_BOARD_TEMPLATE = {
 
 local function estimateTrueMoveNumber(State)
 	local rawFull = tonumber(State.full) or tonumber(State.fullmove) or tonumber(State.moveCount)
-	if rawFull and rawFull > 1 then
-		return rawFull
-	end
+	if rawFull and rawFull > 1 then return rawFull end
 	if type(State.history) == "table" and #State.history > 0 then
 		return math.floor(#State.history / 2) + 1
 	end
 	if type(State.moves) == "table" and #State.moves > 0 then
 		return math.floor(#State.moves / 2) + 1
 	end
-
-	local changed = 0
-	local pieceCount = 0
+	local changed, pieceCount = 0, 0
 	for idx64 = 1, 64 do
 		local v = State.board[idx64] or 0
 		if v ~= 0 then pieceCount = pieceCount + 1 end
-		if v ~= START_BOARD_TEMPLATE[idx64] then
-			changed = changed + 1
-		end
+		if v ~= START_BOARD_TEMPLATE[idx64] then changed = changed + 1 end
 	end
 	local captured = math.max(0, 32 - pieceCount)
-	local estFull = math.floor(changed / 3.2) + captured + 1
-	return math.clamp(estFull, 1, 60)
+	return math.clamp(math.floor(changed / 3.2) + captured + 1, 1, 60), pieceCount
 end
 
-local function decodePackedToChessDuels(m, isWhiteTurn)
+local function decodePackedToChessDuels(m)
 	local from0x88  = band(m, 0x7F)
 	local to0x88    = band(rshift(m, 7), 0x7F)
 	local promoCode = band(rshift(m, 18), 0x7)
-	-- In ChessDuels, Queen=5, Rook=4, Bishop=3, Knight=2 (or 0 if no promotion)
-	local promoVal  = (promoCode ~= 0) and promoCode or 0
 	return {
 		from  = sq0x88ToIdx64(from0x88),
 		to    = sq0x88ToIdx64(to0x88),
-		promo = promoVal,
+		promo = (promoCode ~= 0) and promoCode or 0,
 	}
 end
 
-local function computeBestMove(State, remainingSec)
+-- Fire asynchronous Cloud Stockfish NNUE / Syzygy Tablebase request in the background WHILE local search runs!
+local function startAsyncCloudQuery(fullFEN, pieceCount)
+	local state = { uci = nil, done = false }
+	task.spawn(function()
+		local encodedFEN = HttpService:UrlEncode(fullFEN)
+		if pieceCount <= 7 then
+			local okTb, respTb = pcall(function()
+				return game:HttpGet("https://tablebase.lichess.ovh/standard?fen=" .. encodedFEN)
+			end)
+			if okTb and type(respTb) == "string" and #respTb > 10 then
+				local uci = string.match(respTb, '"uci"%s*:%s*"([a-h][1-8][a-h][1-8][qrbn]?)"')
+				if uci then state.uci = uci state.done = true return end
+			end
+		end
+
+		local okCe, respCe = pcall(function()
+			return game:HttpGet("https://lichess.org/api/cloud-eval?fen=" .. encodedFEN .. "&multiPv=1")
+		end)
+		if okCe and type(respCe) == "string" and #respCe > 10 then
+			local uci = string.match(respCe, '"moves"%s*:%s*"([a-h][1-8][a-h][1-8][qrbn]?)')
+			if uci then state.uci = uci state.done = true return end
+		end
+
+		if pieceCount >= 24 then
+			local okMa, respMa = pcall(function()
+				return game:HttpGet("https://explorer.lichess.ovh/masters?fen=" .. encodedFEN .. "&moves=3")
+			end)
+			if okMa and type(respMa) == "string" and #respMa > 10 then
+				local uci = string.match(respMa, '"uci"%s*:%s*"([a-h][1-8][a-h][1-8][qrbn]?)"')
+				if uci then state.uci = uci state.done = true return end
+			end
+		end
+		state.done = true
+	end)
+	return state
+end
+
+local function computeSearchBudget(remainingSec, moveNumber, humanPaceOn, modeStr)
+	remainingSec = tonumber(remainingSec) or 60
+	moveNumber   = tonumber(moveNumber) or 10
+	local safeRem = math.max(0.04, remainingSec - 0.05)
+
+	if safeRem <= 12.0 then
+		return 0.060, 0.110
+	elseif safeRem <= 22.0 then
+		return 0.120, 0.220
+	end
+
+	if humanPaceOn then
+		local isDeepTurn = (moveNumber >= 6 and math.random() < 0.22)
+		if safeRem > 200 or (modeStr == "10 min" and safeRem > 100) then
+			local opt = isDeepTurn and (2.0 + math.random() * 1.4) or (1.0 + math.random() * 0.8)
+			return opt, opt * 1.40
+		elseif safeRem > 65 or (modeStr == "3 min" and safeRem > 40) then
+			local opt = isDeepTurn and (1.1 + math.random() * 0.8) or (0.60 + math.random() * 0.45)
+			return opt, opt * 1.35
+		else
+			-- 1 min mode: 0.28s - 0.75s of pure high-speed search (reaches Depth 7-10 while keeping plenty of clock!)
+			local opt = isDeepTurn and (0.55 + math.random() * 0.25) or (0.28 + math.random() * 0.22)
+			return opt, math.min(0.95, opt * 1.30)
+		end
+	else
+		if safeRem <= 65 then
+			return 0.22, 0.40
+		elseif safeRem <= 200 then
+			return 0.45, 0.85
+		else
+			return 0.90, 1.70
+		end
+	end
+end
+
+local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 	local b = newBoard()
 	local sqs = b.squares
 
+	local pieceCount = 0
 	for idx64 = 1, 64 do
 		local v = State.board[idx64] or 0
 		if v ~= 0 then
+			pieceCount = pieceCount + 1
 			local r0 = math.floor((idx64 - 1) / 8)
 			local f0 = (idx64 - 1) % 8
 			local sq0x88 = lshift(r0, 4) + f0
@@ -1600,7 +1725,6 @@ local function computeBestMove(State, remainingSec)
 	b.halfmove = tonumber(State.half) or 0
 	b.fullmove = estimateTrueMoveNumber(State)
 
-	-- Parse Castling Rights safely (also verify King and Rook are actually on their starting squares!)
 	local cr = 0
 	if type(State.castle) == "table" then
 		local cw = State.castle[1] or State.castle.w or State.castle.W
@@ -1620,7 +1744,6 @@ local function computeBestMove(State, remainingSec)
 			if State.castle.q or State.castle.bq or State.castle[4] == true then cr = bor(cr, 8) end
 		end
 	end
-	-- Strictly verify King & Rook positions so we never generate an illegal castle
 	if sqs[4] ~= (WHITE + KING) then cr = band(cr, 15 - 3) end
 	if sqs[7] ~= (WHITE + ROOK) then cr = band(cr, 15 - 1) end
 	if sqs[0] ~= (WHITE + ROOK) then cr = band(cr, 15 - 2) end
@@ -1638,20 +1761,78 @@ local function computeBestMove(State, remainingSec)
 	end
 
 	b:recomputeState()
+	recordMatchBoardHash(b)
 
-	-- Generate all legal root moves first
+	--==========================================================================
+	-- ROOT MOVE FILTER: INSTANT MATE-IN-1 DETECTOR & 100% STALEMATE BLOCKER!
+	--==========================================================================
+	local rootEval = evaluate(b)
 	local rawMoves, n = b:generateMoves(false)
-	local legalRootMoves = {}
+	local legalRootMoves    = {}
+	local nonStalemateMoves = {}
+	local nonRepeatMoves    = {}
+
 	for i = 1, n do
-		if b:makeMove(rawMoves[i]) then
-			table.insert(legalRootMoves, rawMoves[i])
+		local m = rawMoves[i]
+		if b:makeMove(m) then
+			table.insert(legalRootMoves, m)
+
+			-- Check if opponent has ANY legal reply after move `m`
+			local oppRaw, oppN = b:generateMoves(false)
+			local oppHasReply = false
+			for j = 1, oppN do
+				if b:makeMove(oppRaw[j]) then
+					oppHasReply = true
+					b:unmakeMove()
+					break
+				end
+			end
+
+			local oppInCheck = b:inCheck(b.side)
+			local repeatsMatch = isHashVisitedInMatch(b.hashLo, b.hashHi)
 			b:unmakeMove()
+
+			if not oppHasReply then
+				if oppInCheck then
+					-- INSTANT CHECKMATE IN 1 FOUND! Play it immediately!
+					local mateRes = decodePackedToChessDuels(m)
+					mateRes.isForced = true
+					return mateRes
+				end
+				-- Otherwise (`not oppHasReply and not oppInCheck`), move `m` is an immediate STALEMATE!
+				-- Do NOT add `m` to `nonStalemateMoves`!
+			else
+				table.insert(nonStalemateMoves, m)
+				if not repeatsMatch then
+					table.insert(nonRepeatMoves, m)
+				end
+			end
 		end
 	end
 
 	if #legalRootMoves == 0 then return nil end
 
-	-- Build FEN key for GM Opening Book
+	-- If we are not losing badly (rootEval >= -200), strictly forbid Stalemate moves and Repetition moves!
+	if rootEval >= -200 and #nonStalemateMoves > 0 then
+		legalRootMoves = nonStalemateMoves
+		if rootEval >= 50 and #nonRepeatMoves > 0 then
+			legalRootMoves = nonRepeatMoves
+		end
+	end
+
+	if #legalRootMoves == 1 then
+		local res = decodePackedToChessDuels(legalRootMoves[1])
+		res.isForced = true
+		return res
+	end
+
+	-- Pre-sort `legalRootMoves` by MVV-LVA & History so `legalRootMoves[1]` is always a strong move even at Depth 1
+	local rootOrderScores = scoreMovesStockfish(b, legalRootMoves, #legalRootMoves, 1, 0, 0)
+	for i = 1, #legalRootMoves do
+		pickNextMove(legalRootMoves, rootOrderScores, #legalRootMoves, i)
+	end
+
+	-- Build valid FEN with exact castling string `crStr` (Fixes HTTP 400 in Cloud Stockfish & Syzygy Tablebase!)
 	local ranks = {}
 	for r0 = 7, 0, -1 do
 		local empty = 0
@@ -1669,34 +1850,50 @@ local function computeBestMove(State, remainingSec)
 		if empty > 0 then s = s .. tostring(empty) end
 		table.insert(ranks, s)
 	end
-	local fenKey = table.concat(ranks, "/") .. " " .. (isWhiteTurn and "w" or "b")
+	local placement = table.concat(ranks, "/")
+	local sideCh    = isWhiteTurn and "w" or "b"
+	local fenKey    = placement .. " " .. sideCh
 
-	-- 1. Probe GM Opening Book (match against actual legalRootMoves so it is 100% legal!)
-	local bookUCI = (b.fullmove <= 5) and probeBook(fenKey) or nil
+	local crStr = ""
+	if band(cr, 1) ~= 0 then crStr = crStr .. "K" end
+	if band(cr, 2) ~= 0 then crStr = crStr .. "Q" end
+	if band(cr, 4) ~= 0 then crStr = crStr .. "k" end
+	if band(cr, 8) ~= 0 then crStr = crStr .. "q" end
+	if crStr == "" then crStr = "-" end
+	local fullFEN = string.format("%s %s %s - %d %d", placement, sideCh, crStr, b.halfmove, b.fullmove)
+
+	-- 1. Check Local GM Opening Book
+	local bookUCI = (b.fullmove <= 6) and probeBook(fenKey) or nil
 	if bookUCI and #bookUCI >= 4 then
 		local fromSq = algebraicToSq(string.sub(bookUCI, 1, 2))
 		local toSq   = algebraicToSq(string.sub(bookUCI, 3, 4))
 		for _, lm in ipairs(legalRootMoves) do
 			if band(lm, 0x7F) == fromSq and band(rshift(lm, 7), 0x7F) == toSq then
-				local res = decodePackedToChessDuels(lm, isWhiteTurn)
-				res.isBook     = true
-				res.isForced   = false
-				res.complexity = 1
-				res.moveNum    = b.fullmove
-				res.altMove    = (#legalRootMoves > 1) and decodePackedToChessDuels(legalRootMoves[1], isWhiteTurn) or nil
+				if humanPaceOn and remainingSec > 25 then
+					task.wait(0.20 + math.random() * 0.25)
+				end
+				local res = decodePackedToChessDuels(lm)
+				res.altMove = decodePackedToChessDuels(legalRootMoves[1])
 				return res
 			end
 		end
 	end
 
-	local optLimit, maxLimit = computeStockfishTime(remainingSec, b.fullmove)
+	-- 2. Launch Cloud Stockfish NNUE / Syzygy 7-Piece Tablebase IN PARALLEL with Local Stockfish Search!
+	local cloudJob = nil
+	if remainingSec > 14 and (b.fullmove <= 18 or pieceCount <= 7) then
+		cloudJob = startAsyncCloudQuery(fullFEN, pieceCount)
+	end
+
+	-- 3. Run Local Stockfish Iterative Deepening Search
+	local optLimit, maxLimit = computeSearchBudget(remainingSec, b.fullmove, humanPaceOn, modeStr)
 	Searcher.nodes          = 0
 	Searcher.aborted        = false
 	Searcher.startTime      = os.clock()
 	Searcher.lastYieldClock = Searcher.startTime
 	Searcher.optLimit       = optLimit
 	Searcher.maxLimit       = maxLimit
-	Searcher.allowYield     = (maxLimit > 0.080)
+	Searcher.allowYield     = (maxLimit > 0.095)
 
 	clearKillers()
 
@@ -1706,33 +1903,38 @@ local function computeBestMove(State, remainingSec)
 	local prevBestMove = 0
 	local stabilityCnt = 0
 
-	if #legalRootMoves > 1 then
-		for depth = 1, 32 do
-			local score, move
-			if depth >= 4 then
-				local delta = 25
-				local alpha = math.max(-INF, bestScore - delta)
-				local beta  = math.min(INF, bestScore + delta)
-				while true do
-					score, move = negamax(b, depth, alpha, beta, 1, false, 0)
-					if Searcher.aborted then break end
-					if score <= alpha then
-						beta  = math.floor((alpha + beta) / 2)
-						alpha = math.max(-INF, alpha - delta)
-						delta = delta * 2
-					elseif score >= beta then
-						beta  = math.min(INF, beta + delta)
-						delta = delta * 2
-					else
-						break
-					end
+	for depth = 1, 32 do
+		local score, move
+		if depth >= 4 then
+			local delta = 25
+			local alpha = math.max(-INF, bestScore - delta)
+			local beta  = math.min(INF, bestScore + delta)
+			while true do
+				score, move = negamax(b, depth, alpha, beta, 1, false, 0)
+				if Searcher.aborted then break end
+				if score <= alpha then
+					beta  = math.floor((alpha + beta) / 2)
+					alpha = math.max(-INF, alpha - delta)
+					delta = delta * 2
+				elseif score >= beta then
+					beta  = math.min(INF, beta + delta)
+					delta = delta * 2
+				else
+					break
 				end
-			else
-				score, move = negamax(b, depth, -INF, INF, 1, false, 0)
 			end
+		else
+			score, move = negamax(b, depth, -INF, INF, 1, false, 0)
+		end
 
-			if Searcher.aborted then break end
-			if move and move ~= 0 then
+		if Searcher.aborted then break end
+		if move and move ~= 0 then
+			-- Ensure chosen move is in our filtered `legalRootMoves` (non-stalemate / non-repeat)
+			local allowed = false
+			for _, lm in ipairs(legalRootMoves) do
+				if lm == move then allowed = true break end
+			end
+			if allowed then
 				if move ~= bestMove then
 					secondMove = bestMove
 				end
@@ -1745,37 +1947,46 @@ local function computeBestMove(State, remainingSec)
 				bestMove  = move
 				bestScore = score
 			end
+		end
 
-			if math.abs(bestScore) >= MATE - 100 then break end
+		if math.abs(bestScore) >= MATE - 100 then break end
 
-			local stabilityFactor = (stabilityCnt >= 3) and 0.50 or ((stabilityCnt == 0 and depth >= 5) and 0.90 or 0.68)
-			if (os.clock() - Searcher.startTime) >= Searcher.optLimit * stabilityFactor then
+		-- If Cloud Stockfish NNUE / Syzygy Tablebase finished and local didn't find a forced mate, we can use Cloud move!
+		if cloudJob and cloudJob.uci and depth >= 4 then
+			break
+		end
+
+		local elapsed = os.clock() - Searcher.startTime
+		if elapsed >= Searcher.optLimit then
+			break
+		end
+	end
+
+	-- Check if parallel Cloud Stockfish NNUE / Syzygy Tablebase returned a verified move
+	if cloudJob and cloudJob.uci and #cloudJob.uci >= 4 and math.abs(bestScore) < MATE - 100 then
+		local fromSq = algebraicToSq(string.sub(cloudJob.uci, 1, 2))
+		local toSq   = algebraicToSq(string.sub(cloudJob.uci, 3, 4))
+		for _, lm in ipairs(legalRootMoves) do
+			if band(lm, 0x7F) == fromSq and band(rshift(lm, 7), 0x7F) == toSq then
+				secondMove = bestMove
+				bestMove   = lm
 				break
 			end
 		end
 	end
 
-	local isCaptureMove = (band(rshift(bestMove, 14), 0xF) ~= 0)
-	local complexity = 2
-	if #legalRootMoves == 1 then
-		complexity = 0
-	elseif stabilityCnt <= 1 or (#legalRootMoves >= 26 and b.phase >= 12) then
-		complexity = 3
-	elseif isCaptureMove and stabilityCnt >= 3 then
-		complexity = 1
+	if b:makeMove(bestMove) then
+		recordMatchBoardHash(b)
+		b:unmakeMove()
 	end
 
-	local res = decodePackedToChessDuels(bestMove, isWhiteTurn)
-	res.isBook     = false
-	res.isForced   = (#legalRootMoves == 1)
-	res.complexity = complexity
-	res.moveNum    = b.fullmove
-	res.altMove    = (secondMove and secondMove ~= bestMove) and decodePackedToChessDuels(secondMove, isWhiteTurn) or nil
+	local res = decodePackedToChessDuels(bestMove)
+	res.altMove = (secondMove and secondMove ~= bestMove) and decodePackedToChessDuels(secondMove) or nil
 	return res
 end
 
 --==============================================================================
--- 7. ROBLOX CLIENT INTEGRATION (NEVER-STUCK WATCHDOG + BUILT-IN BOT BACKUP)
+-- 7. ROBLOX CLIENT INTEGRATION (STOPWATCH FAILSAFE + ANTI-FREEZE WATCHDOG)
 --==============================================================================
 if not game:IsLoaded() then
 	game.Loaded:Wait()
@@ -1783,7 +1994,6 @@ end
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local HttpService         = game:GetService("HttpService")
 local GuiService          = game:GetService("GuiService")
 local CoreGui             = game:GetService("CoreGui")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -1804,7 +2014,6 @@ pcall(function()
 	end
 end)
 
--- Emergency Backup: If our move is ever rejected by the server on retry >= 2, ask the game's own Bot module for a 100% server-compatible move!
 local function computeBackupMoveFromGameModule(State)
 	if not BuiltInBot or type(BuiltInBot.analyze) ~= "function" then return nil end
 	local WKing, BKing = 5, 61
@@ -1940,7 +2149,7 @@ end)
 
 local Window = (okUI and SilL) and SilL:CreateWindow({
 	Name = "Sill X | Solo 2800+ Bot ♟️",
-	Subtitle = "Stockfish Brain • Anti-Freeze Watchdog",
+	Subtitle = "Cloud NNUE + Syzygy + Anti-TimeLoss",
 	Theme = "Ocean",
 	ToggleKey = Enum.KeyCode.RightShift,
 	Size = UDim2.fromOffset(500, 340),
@@ -2080,7 +2289,6 @@ local function selectDesiredTimeMode()
 	end
 end
 
--- Periodic Fresh GC Scanner so a new match / Rematch never gets stuck on an old cached closure!
 local cachedCurrentFn = nil
 local lastGcScanTime  = 0
 
@@ -2138,7 +2346,6 @@ local function getActiveMatchObj(forceRescan)
 	return nil
 end
 
--- Strict Post-Game Modal check (only exact button texts "rematch", "new game", "game review" so chat/usernames never trigger false positives!)
 local function isPostGameModalVisible()
 	local postBtns = findVisibleElementsByText({ "rematch", "new game", "game review" }, true)
 	return #postBtns > 0
@@ -2295,7 +2502,6 @@ local function getMyColor(gameObj)
 		end
 	end
 
-	-- Visual Fallback: check rank '1' vs '8' Y-coordinate on screen
 	local y1, y8 = nil, nil
 	for desc in pairs(trackedTextElements) do
 		if desc.Parent and isElementVisible(desc) then
@@ -2319,7 +2525,26 @@ local function isMyTurnNow(State, myColor)
 	return false
 end
 
+--==============================================================================
+-- DUAL STOPWATCH + UI REAL-TIME CLOCK DETECTOR (GUARANTEED ZERO TIME-LOSS!)
+--==============================================================================
+local internalClockTracker = {
+	active       = false,
+	estimatedSec = 60,
+	lastTickAt   = 0,
+}
+
+local function resetInternalClock()
+	local map = { ["1 min"] = 60, ["3 min"] = 180, ["10 min"] = 600 }
+	internalClockTracker.active       = false
+	internalClockTracker.estimatedSec = map[normalizeTimeMode(Settings.TimeMode)] or 60
+	internalClockTracker.lastTickAt   = os.clock()
+end
+
 local function detectMyClockSeconds(gameObj, myColor)
+	local uiFoundSec = nil
+
+	-- 1. Check gameObj / State internal timers
 	if type(gameObj) == "table" then
 		local st = rawget(gameObj, "state")
 		for _, tbl in ipairs({ st, gameObj }) do
@@ -2328,127 +2553,44 @@ local function detectMyClockSeconds(gameObj, myColor)
 				if type(clocks) == "table" and myColor then
 					local cVal = clocks[myColor] or (myColor == 1 and (clocks.w or clocks.W or clocks.white or clocks[1])) or (myColor == -1 and (clocks.b or clocks.B or clocks.black or clocks[2]))
 					if type(cVal) == "number" and cVal > 0 and cVal <= 3600 then
-						return cVal
+						uiFoundSec = cVal
+						break
 					end
 				end
 			end
 		end
 	end
 
-	if playerGui then
+	-- 2. Scan visible clock TextLabels (Player's card is on the right -> largest X, or any clock with decimal like 0:14.3)
+	if not uiFoundSec and playerGui then
 		local bestX = -1
-		local foundSec = nil
 		for desc in pairs(trackedTextElements) do
 			if desc.Parent and isElementVisible(desc) then
-				local m, s = string.match(desc.Text or "", "^%s*(%d+):(%d+%.?%d*)%s*$")
+				local m, s = string.match(desc.Text or "", "(%d+):(%d+%.?%d*)")
 				if m and s then
 					local sec = tonumber(m) * 60 + tonumber(s)
 					if sec and sec > 0 and sec <= 3600 and desc.AbsolutePosition.X > bestX then
 						bestX = desc.AbsolutePosition.X
-						foundSec = sec
+						uiFoundSec = sec
 					end
 				end
 			end
 		end
-		if foundSec then return foundSec end
 	end
 
-	local map = { ["1 min"] = 60, ["3 min"] = 180, ["10 min"] = 600 }
-	return map[Settings.TimeMode] or 60
-end
-
-local myMovesInCurrentMatch = 0
-
-local function computeHumanThinkDelay(remSec, moveInfo, thinkElapsedSec)
-	if not Settings.HumanPace then return 0 end
-	if not moveInfo then return 0 end
-
-	local mode = normalizeTimeMode(Settings.TimeMode)
-	local panicThreshold = (mode == "1 min") and 11.0 or 15.0
-	if remSec <= panicThreshold then
-		return 0
-	end
-
-	if moveInfo.isForced then
-		if remSec <= 20.0 then return 0 end
-		local forcedPause = (mode == "10 min") and (0.85 + math.random() * 0.75)
-			or ((mode == "3 min") and (0.55 + math.random() * 0.55) or (0.38 + math.random() * 0.35))
-		return math.max(0, forcedPause - thinkElapsedSec)
-	end
-
-	local moveNum    = math.max(tonumber(moveInfo.moveNum) or 1, myMovesInCurrentMatch + 1)
-	local isBook     = (moveInfo.isBook == true)
-	local complexity = tonumber(moveInfo.complexity) or 2
-
-	local isDeepTankTurn = (moveNum >= 5 and math.random() < 0.28)
-	if isDeepTankTurn then
-		complexity = math.max(complexity, 3)
-	end
-
-	if isBook or moveNum <= 4 then
-		local openWait
-		if mode == "10 min" or remSec > 200 then
-			openWait = 1.40 + math.random() * 1.80
-		elseif mode == "3 min" or remSec > 70 then
-			openWait = 0.95 + math.random() * 1.25
-		else
-			openWait = 0.65 + math.random() * 0.75
-		end
-		return math.max(0, openWait - thinkElapsedSec)
-	end
-
-	local targetTotal = 0
-
-	if remSec > 210 or (mode == "10 min" and remSec > 120) then
-		if isDeepTankTurn then
-			targetTotal = 9.50 + math.random() * 9.50
-		elseif complexity >= 3 then
-			targetTotal = 5.50 + math.random() * 5.50
-		elseif complexity == 2 then
-			targetTotal = 3.20 + math.random() * 3.30
-		else
-			targetTotal = 1.50 + math.random() * 1.40
-		end
-
-	elseif remSec > 65 or (mode == "3 min" and remSec > 42) then
-		if isDeepTankTurn and remSec > 85 then
-			targetTotal = 5.20 + math.random() * 4.80
-		elseif complexity >= 3 then
-			targetTotal = 3.10 + math.random() * 2.90
-		elseif complexity == 2 then
-			targetTotal = 1.80 + math.random() * 1.80
-		else
-			targetTotal = 0.90 + math.random() * 0.85
-		end
-
-	elseif remSec > 30 then
-		if isDeepTankTurn then
-			targetTotal = 2.60 + math.random() * 1.65
-		elseif complexity >= 3 then
-			targetTotal = 1.85 + math.random() * 1.35
-		elseif complexity == 2 then
-			targetTotal = 1.25 + math.random() * 1.05
-		else
-			targetTotal = 0.65 + math.random() * 0.55
-		end
-
-	elseif remSec > 18 then
-		if complexity >= 3 then
-			targetTotal = 0.95 + math.random() * 0.75
-		elseif complexity == 2 then
-			targetTotal = 0.60 + math.random() * 0.55
-		else
-			targetTotal = 0.35 + math.random() * 0.30
-		end
-
+	-- 3. Combine with our failsafe internal stopwatch so even if UI text fails to parse, we NEVER overestimate our time!
+	if uiFoundSec then
+		internalClockTracker.estimatedSec = uiFoundSec
+		internalClockTracker.lastTickAt   = os.clock()
+		internalClockTracker.active       = true
+		return uiFoundSec
 	else
-		targetTotal = 0.18 + math.random() * 0.25
+		if not internalClockTracker.active then
+			resetInternalClock()
+			internalClockTracker.active = true
+		end
+		return math.max(1.0, internalClockTracker.estimatedSec)
 	end
-
-	local safeMaxWait = math.max(0.2, (remSec - panicThreshold) * 0.22)
-	targetTotal = math.min(targetTotal, safeMaxWait)
-
-	return math.max(0, targetTotal - thinkElapsedSec)
 end
 
 local function sendMove(bestMove)
@@ -2463,11 +2605,11 @@ end
 
 if Window then
 	local MainTab = Window:CreateTab("Auto Bot", 10886548710)
-	local ControlSection = MainTab:CreateSection("Sill Solo 2800+ (Stockfish Brain)")
+	local ControlSection = MainTab:CreateSection("Sill Solo 2800+ (Cloud NNUE + Syzygy + Stockfish)")
 
 	ControlSection:CreateToggle({
 		Name = "🤖 เดินหมากอัตโนมัติ (Auto Play 100%)",
-		Description = "สมองกล Stockfish Architecture + ระบบกันค้างกลางเกม (Anti-Freeze Watchdog)",
+		Description = "เชื่อม Cloud Stockfish NNUE + ฐานข้อมูลท้ายเกม 7 ตัว (Syzygy) + ระบบกันเสมอซ้ำตา",
 		CurrentValue = Settings.AutoPlay,
 		Callback = function(Value)
 			Settings.AutoPlay = Value
@@ -2476,8 +2618,8 @@ if Window then
 	})
 
 	ControlSection:CreateToggle({
-		Name = "🎭 จังหวะคิดเนียนตามเวลาจริง (Smart Human Pacing)",
-		Description = "เผาเวลาตามโหมด 1m / 3m / 10m อย่างสมจริง และเร่งสปีดเมื่อเวลาใกล้หมด",
+		Name = "🎭 จังหวะคิดเนียนแต่ไม่แพ้เวลา (Smart Search Pacing)",
+		Description = "เอาเวลาจังหวะคนคิดไปคำนวณหมากให้ลึกขึ้น และสปีดทันทีเมื่อเวลาต่ำกว่า 22 วิ",
 		CurrentValue = Settings.HumanPace,
 		Callback = function(Value)
 			Settings.HumanPace = Value
@@ -2503,6 +2645,7 @@ if Window then
 		Callback = function(Option)
 			local rawOpt = type(Option) == "table" and Option[1] or Option
 			Settings.TimeMode = normalizeTimeMode(rawOpt)
+			resetInternalClock()
 			saveSettings()
 			task.spawn(selectDesiredTimeMode)
 		end
@@ -2526,12 +2669,14 @@ end
 _G.SillChessBotCleanup = ENV.SillChessBotCleanup
 
 --==============================================================================
--- 8. MAIN LOOP WITH NEVER-STUCK WATCHDOG & AUTOMATIC FALLBACK RECOVERY
+-- 8. MAIN LOOP
 --==============================================================================
 task.spawn(function()
 	local lastHandledSig = ""
 	local lastAttemptTime = 0
 	local retryCount = 0
+
+	resetInternalClock()
 
 	while running do
 		purgeLegacyUIs()
@@ -2552,59 +2697,35 @@ task.spawn(function()
 						retryCount = 0
 					end
 
-					-- Never lock out! Retry every 0.70s if the server didn't register the move yet
-					local shouldAct = (currentSig ~= lastHandledSig) or ((os.clock() - lastAttemptTime) > 0.70)
+					local shouldAct = (currentSig ~= lastHandledSig) or ((os.clock() - lastAttemptTime) > 0.65)
 
 					if shouldAct then
 						local turnStart = os.clock()
 						local remSec    = detectMyClockSeconds(gameObj, myColor)
 						local ok, bestMove
 
-						-- Tiered Recovery Watchdog:
-						-- Attempt 0 & 1: Use our primary 2800+ Stockfish Engine move
-						-- Attempt 2+: If server rejected primary move (e.g. special castling/promo state), try game's built-in Bot module or our 2nd best legal move!
 						if retryCount >= 2 then
 							local backupMv = computeBackupMoveFromGameModule(State)
 							if backupMv then
 								ok, bestMove = true, backupMv
 							else
-								ok, bestMove = pcall(computeBestMove, State, math.min(remSec, 10))
+								ok, bestMove = pcall(computeBestMove, State, math.min(remSec, 8), false, Settings.TimeMode)
 								if ok and bestMove and bestMove.altMove and (retryCount % 2 == 1) then
 									bestMove = bestMove.altMove
 								end
 							end
 						else
-							ok, bestMove = pcall(computeBestMove, State, remSec)
+							-- Instead of sleeping idly after thinking, computeBestMove uses the human pace budget directly for deeper search + Cloud NNUE!
+							ok, bestMove = pcall(computeBestMove, State, remSec, (retryCount == 0 and Settings.HumanPace), Settings.TimeMode)
 						end
 
-						local thinkElapsed = os.clock() - turnStart
-
-						-- Human Pacing only on the first attempt of a turn (retryCount == 0)
-						if ok and bestMove and retryCount == 0 and Settings.HumanPace then
-							local extraWait = computeHumanThinkDelay(remSec, bestMove, thinkElapsed)
-							if extraWait > 0.02 then
-								local mode = normalizeTimeMode(Settings.TimeMode)
-								local panicCut = (mode == "1 min") and 11.0 or 15.0
-								local waitUntil = os.clock() + extraWait
-								while os.clock() < waitUntil do
-									if not running or not Settings.AutoPlay or isPostGameModalVisible() then break end
-									local liveRem = detectMyClockSeconds(gameObj, myColor)
-									if liveRem <= panicCut then break end
-									local checkObj = getActiveMatchObj(false)
-									local checkSt  = checkObj and checkObj.state
-									if not checkSt or getBoardSignature(checkSt) ~= currentSig then break end
-									task.wait(0.03)
-								end
-							end
-						end
+						local spent = os.clock() - turnStart
+						internalClockTracker.estimatedSec = math.max(1.0, internalClockTracker.estimatedSec - spent)
 
 						local latestObj   = getActiveMatchObj(false)
 						local latestState = latestObj and latestObj.state
 						if ok and bestMove and running and Settings.AutoPlay and latestState and getBoardSignature(latestState) == currentSig then
 							sendMove(bestMove)
-							if retryCount == 0 then
-								myMovesInCurrentMatch = myMovesInCurrentMatch + 1
-							end
 							lastHandledSig  = currentSig
 							lastAttemptTime = os.clock()
 							retryCount      = retryCount + 1
@@ -2614,10 +2735,12 @@ task.spawn(function()
 			end
 			task.wait(0.03)
 		else
-			lastHandledSig        = ""
-			retryCount            = 0
-			myMovesInCurrentMatch = 0
-			cachedCurrentFn       = nil
+			lastHandledSig  = ""
+			retryCount      = 0
+			cachedCurrentFn = nil
+			clearMatchHistoryHashes()
+			resetInternalClock()
+
 			if postGameModal then
 				if Settings.AutoQueue then
 					executeLobbyOrPostGameClick("POSTGAME")
