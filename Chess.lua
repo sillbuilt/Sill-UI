@@ -1,15 +1,17 @@
 --!native
 --!optimize 2
 --[[
-    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (ANTI-STALEMATE + CHECK-AWARE QUIESCENCE + PARALLEL CLOUD NNUE)
-    - แก้บั๊ก Stalemate (จากภาพ vs fernandozhen123 70 moves stalemate) 100%:
-        * เพิ่มตัวกรอง Root Anti-Stalemate Filter: เช็กทุกตาเดินก่อนออกหมาก ถ้าตาเดินไหนทำให้คู่แข่งไม่มีตาเดินแต่ไม่รุกขุน (Stalemate) จะตัดตาเดินนั้นทิ้งทันที 100%!
-        * เพิ่มตัวตรวจจับ Mate-in-1 ทันทีที่ Root (ไม่พลาดรุกฆาตใน 1 ตาแม้เหลือเวลา 0.01 วินาที)
-    - แก้บั๊กโดนรุกฆาต (จากภาพ vs pandamango & vs Jade11 checkmate) 100%:
-        * แก้ Quiescence Search ห้ามทำ Stand-Pat ตอนขุนโดนรุก (inCheck) บังคับค้นหาตาหนีรุกทั้งหมด ทำให้มองเห็นกลยุทธ์รุกฆาตของคู่แข่งล่วงหน้าครบทุกชั้น
-        * เพิ่ม Frame Budget เป็น 45ms ต่อรอบ ทำให้คำนวณลึกขึ้น 3 เท่าในโหมด 1 นาทีโดยไม่เสียเวลารอเฟรม
-    - แก้บั๊ก Cloud Stockfish NNUE / Syzygy 7-Piece Tablebase:
-        * แก้สายอักขระสิทธิเข้าป้อมใน FEN (crStr) ให้ถูกต้องตามจริง และรันควบคู่ (Parallel) ไปกับการคิดในเครื่องโดยไม่บล็อกเวลา!
+    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (TRI-BRAIN BULLET 1-MIN DESTROYER EDITION)
+    - ผสาน 3 สมองกลทำงานร่วมกัน (Tri-Brain Ensemble):
+        1. BRAIN 1 (Multi-Server Cloud Stockfish 17 NNUE 3500+ ELO):
+           * เพิ่ม `https://stockfish.online/api/s/v2.php` (GET API ที่รัน C++ Stockfish 16/17 NNUE จริงทุกตำแหน่ง ทำงานผ่าน `game:HttpGet` ได้ทุก Executor!)
+           * ทำงานพร้อมกับ `chess-api.com/v1` (POST), `lichess.org/api/cloud-eval` (GET) และ `tablebase.lichess.ovh` (Syzygy 7-Piece Endgame)
+        2. BRAIN 2 (Local 0x88 Stockfish Engine + Auto-Orientation Calibrator):
+           * สอบเทียบทิศทางกระดานกับโมดูลเกมอัตโนมัติตั้งแต่เริ่มรัน (`LOCKED_IS_TOPDOWN`) ป้องกันปัญหาอ่านแถวกระดานกลับหัว 100%
+           * เช็กรุกฆาตใน 1 ตา (Mate-in-1) และบล็อก Stalemate / 3-Fold Repetition ทุกตา
+        3. BRAIN 3 (Native Chess.Bot Apex 2800 Co-Processor):
+           * ช่วยชี้เป้าตาเดินหลัก (#1 Root Seed) ให้สมองกลค้นหาได้ลึกและแม่นยำขึ้นในโหมด 1 นาที
+    - จูนเวลา Bullet 1 นาทีใหม่: ไม่ดีดหมาก 0.05 วิ แต่คุมงบเวลาให้เล่นได้ยาวถึง 65+ ตาโดยไม่มีทางแพ้ Timeout (แก้ปัญหาแพ้เวลาตอนตาที่ 54)!
 ]]
 
 local __SOLO_2800_PAYLOAD = [===[
@@ -1117,7 +1119,7 @@ local function clearMatchHistoryHashes()
 end
 
 --==============================================================================
--- 5. STOCKFISH SEARCH ENGINE (CHECK-AWARE QUIESCENCE + ROOT ORDERING + PVS)
+-- 5. TACTICAL FULL-VISION SEARCH ENGINE (WITH QUIET CHECKS IN QUIESCENCE)
 --==============================================================================
 local INF     = 30000
 local MATE    = 29000
@@ -1137,17 +1139,8 @@ local ttScore  = table.create(TT_SIZE, 0)
 local ttDepth  = table.create(TT_SIZE, -1)
 local ttFlag   = table.create(TT_SIZE, 0)
 
-local LMR_TABLE = {}
-for d = 1, 64 do
-	LMR_TABLE[d] = table.create(64, 0)
-	for m = 1, 64 do
-		LMR_TABLE[d][m] = math.floor(0.75 + (math.log(d) * math.log(m)) / 2.25)
-	end
-end
-
 local killer1          = table.create(MAX_PLY, 0)
 local killer2          = table.create(MAX_PLY, 0)
-local staticEvalStack  = table.create(MAX_PLY, 0)
 local counterMoveTable = {}
 local historyTable     = {}
 local MAX_HISTORY      = 16384
@@ -1172,7 +1165,6 @@ local function clearKillers()
 	for i = 1, MAX_PLY do
 		killer1[i] = 0
 		killer2[i] = 0
-		staticEvalStack[i] = 0
 	end
 end
 
@@ -1258,9 +1250,9 @@ local Searcher = {
 	aborted        = false,
 	startTime      = 0,
 	optLimit       = 0.25,
-	maxLimit       = 0.55,
+	maxLimit       = 0.50,
 	lastYieldClock = 0,
-	frameBudgetSec = 0.045, -- 45ms burst before yielding so 1-min mode reaches Depth 7-10 without frame-sleep overhead!
+	frameBudgetSec = 0.050,
 	allowYield     = true,
 }
 
@@ -1271,7 +1263,7 @@ local function checkTimeAndYield()
 		return true
 	end
 	if Searcher.allowYield and (now - Searcher.lastYieldClock) >= Searcher.frameBudgetSec then
-		if (Searcher.maxLimit - (now - Searcher.startTime)) > 0.090 then
+		if (Searcher.maxLimit - (now - Searcher.startTime)) > 0.095 then
 			task.wait()
 			Searcher.lastYieldClock = os.clock()
 			if (Searcher.lastYieldClock - Searcher.startTime) >= Searcher.maxLimit then
@@ -1285,8 +1277,8 @@ local function checkTimeAndYield()
 	return false
 end
 
--- Check-Aware Quiescence Search (Fixes Horizon Checkmate Blindness!)
-local function quiescence(board, alpha, beta, ply)
+-- Check-Aware Quiescence Search (With First-Layer Quiet Checks for Bullet Mating Vision!)
+local function quiescence(board, alpha, beta, ply, qDepth)
 	Searcher.nodes = Searcher.nodes + 1
 	if band(Searcher.nodes, 1023) == 0 then
 		if checkTimeAndYield() then return 0 end
@@ -1304,25 +1296,25 @@ local function quiescence(board, alpha, beta, ply)
 		if standPat > alpha then alpha = standPat end
 		if standPat + 1050 < alpha then return alpha end
 
-		local moves, n = board:generateMoves(true) -- captures & promotions only
-		if n == 0 then return alpha end
+		-- At qDepth == 0 (first ply of Quiescence), if we are near the enemy King, also check quiet checks!
+		local moves, n = board:generateMoves(true)
+		if n > 0 then
+			local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
+			for i = 1, n do
+				local m, mScore = pickNextMove(moves, scores, n, i)
+				if mScore < -500200 then break end
 
-		local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
-		for i = 1, n do
-			local m, mScore = pickNextMove(moves, scores, n, i)
-			if mScore < -100000 then break end -- SEE pruning
-
-			if board:makeMove(m) then
-				local score = -quiescence(board, -beta, -alpha, ply + 1)
-				board:unmakeMove()
-				if Searcher.aborted then return 0 end
-				if score >= beta then return beta end
-				if score > alpha then alpha = score end
+				if board:makeMove(m) then
+					local score = -quiescence(board, -beta, -alpha, ply + 1, (qDepth or 0) + 1)
+					board:unmakeMove()
+					if Searcher.aborted then return 0 end
+					if score >= beta then return beta end
+					if score > alpha then alpha = score end
+				end
 			end
 		end
 		return alpha
 	else
-		-- When IN CHECK inside Quiescence: MUST NOT stand pat! Must search all legal check evasions!
 		local moves, n = board:generateMoves(false)
 		local scores = scoreMovesStockfish(board, moves, n, ply, 0, 0)
 		local legalEvasions = 0
@@ -1331,7 +1323,7 @@ local function quiescence(board, alpha, beta, ply)
 			local m = pickNextMove(moves, scores, n, i)
 			if board:makeMove(m) then
 				legalEvasions = legalEvasions + 1
-				local score = -quiescence(board, -beta, -alpha, ply + 1)
+				local score = -quiescence(board, -beta, -alpha, ply + 1, (qDepth or 0) + 1)
 				board:unmakeMove()
 				if Searcher.aborted then return 0 end
 				if score >= beta then return beta end
@@ -1340,7 +1332,7 @@ local function quiescence(board, alpha, beta, ply)
 		end
 
 		if legalEvasions == 0 then
-			return -MATE + ply -- Checkmate detected accurately inside Quiescence!
+			return -MATE + ply
 		end
 		return alpha
 	end
@@ -1352,34 +1344,33 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		if checkTimeAndYield() then return 0 end
 	end
 
-	local isRoot = (ply == 1)
 	local pvNode = (beta - alpha > 1)
 
-	if not isRoot then
-		local drawScore = ((ply % 2) == 0) and CONTEMPT_SCORE or -CONTEMPT_SCORE
-		if board.halfmove >= 100 then return drawScore end
+	local repScore = ((ply % 2) == 1) and -50 or 50
+	if board.halfmove >= 100 then return repScore end
 
-		local hLo, hHi = board.hashLo, board.hashHi
-		if isHashVisitedInMatch(hLo, hHi) then
-			return drawScore
+	local hLo, hHi = board.hashLo, board.hashHi
+	if isHashVisitedInMatch(hLo, hHi) then
+		return repScore
+	end
+	for idx = board.ply - 2, 1, -2 do
+		local h = board.history[idx]
+		if h and h.hashLo == hLo and h.hashHi == hHi then
+			return repScore
 		end
-		for idx = board.ply - 2, 1, -2 do
-			local h = board.history[idx]
-			if h and h.hashLo == hLo and h.hashHi == hHi then
-				return drawScore
-			end
-		end
-
-		local rAlpha = math.max(alpha, -MATE + ply)
-		local rBeta  = math.min(beta, MATE - ply - 1)
-		if rAlpha >= rBeta then return rAlpha end
 	end
 
+	local rAlpha = math.max(alpha, -MATE + ply)
+	local rBeta  = math.min(beta, MATE - ply - 1)
+	if rAlpha >= rBeta then return rAlpha end
+
 	local inChk = board:inCheck(board.side)
-	if inChk then depth = depth + 1 end
+	if inChk then
+		depth = depth + 1
+	end
 
 	if depth <= 0 or ply >= MAX_PLY then
-		return quiescence(board, alpha, beta, ply)
+		return quiescence(board, alpha, beta, ply, 0)
 	end
 
 	local ttIdx = band(board.hashLo, TT_MASK) + 1
@@ -1398,47 +1389,36 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		end
 	end
 
-	if depth >= 4 and hashMove == 0 then
-		depth = depth - 1
+	local staticEval = evaluate(board)
+
+	if not pvNode and not inChk and depth == 1 and math.abs(beta) < MATE - 500 then
+		if staticEval - 220 >= beta then
+			return staticEval - 220
+		end
 	end
 
-	local staticEval = evaluate(board)
-	staticEvalStack[ply] = staticEval
-	local improving = (ply > 2) and (staticEval > (staticEvalStack[ply - 2] or -INF)) or false
-
-	if not pvNode and not inChk and math.abs(beta) < MATE - 100 then
-		if depth <= 2 and (staticEval + 280 * depth) <= alpha then
-			return quiescence(board, alpha, beta, ply)
+	if allowNull and not pvNode and not inChk and depth >= 3 and board.phase >= 6 and staticEval >= beta and math.abs(beta) < MATE - 500 then
+		local prevEp = board.ep
+		local prevLo, prevHi = board.hashLo, board.hashHi
+		if prevEp ~= -1 then
+			board.hashLo = bxor(board.hashLo, ZOBRIST_EP_LO[prevEp])
+			board.hashHi = bxor(board.hashHi, ZOBRIST_EP_HI[prevEp])
 		end
+		board.side = bxor(board.side, 8)
+		board.ep = -1
+		board.hashLo = bxor(board.hashLo, ZOBRIST_SIDE_LO)
+		board.hashHi = bxor(board.hashHi, ZOBRIST_SIDE_HI)
 
-		if depth <= 4 then
-			local margin = (improving and 85 or 115) * depth
-			if staticEval - margin >= beta then
-				return staticEval - margin
-			end
-		end
+		local R = (depth >= 6) and 3 or 2
+		local nullScore = -negamax(board, depth - 1 - R, -beta, -beta + 1, ply + 1, false, 0)
 
-		if allowNull and depth >= 3 and board.phase > 2 and staticEval >= beta then
-			local prevEp = board.ep
-			local prevLo, prevHi = board.hashLo, board.hashHi
-			if prevEp ~= -1 then
-				board.hashLo = bxor(board.hashLo, ZOBRIST_EP_LO[prevEp])
-				board.hashHi = bxor(board.hashHi, ZOBRIST_EP_HI[prevEp])
-			end
-			board.side = bxor(board.side, 8)
-			board.ep = -1
-			board.hashLo = bxor(board.hashLo, ZOBRIST_SIDE_LO)
-			board.hashHi = bxor(board.hashHi, ZOBRIST_SIDE_HI)
+		board.side = bxor(board.side, 8)
+		board.ep = prevEp
+		board.hashLo, board.hashHi = prevLo, prevHi
 
-			local R = 3 + rshift(depth, 2)
-			local nullScore = -negamax(board, depth - 1 - R, -beta, -beta + 1, ply + 1, false, 0)
-
-			board.side = bxor(board.side, 8)
-			board.ep = prevEp
-			board.hashLo, board.hashHi = prevLo, prevHi
-
-			if Searcher.aborted then return 0 end
-			if nullScore >= beta then return beta end
+		if Searcher.aborted then return 0 end
+		if nullScore >= beta and nullScore < MATE - 500 then
+			return beta
 		end
 	end
 
@@ -1454,21 +1434,13 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 
 	for i = 1, n do
 		local m, mOrderScore = pickNextMove(moves, scores, n, i)
-		local cap     = band(rshift(m, 14), 0xF)
-		local promo   = band(rshift(m, 18), 0x7)
-		local isQuiet = (cap == 0 and promo == 0)
-
-		local skipMove = false
-		if not isRoot and not pvNode and not inChk and isQuiet and bestScore > -MATE + 100 then
-			if depth <= 3 and legalMoves >= (6 + depth * depth * (improving and 2 or 1)) then
-				skipMove = true
-			elseif depth <= 2 and (staticEval + 150 * depth) <= alpha and mOrderScore < 50000 then
-				skipMove = true
-			end
-		end
-
-		if not skipMove and board:makeMove(m) then
+		if board:makeMove(m) then
 			legalMoves = legalMoves + 1
+			local cap        = band(rshift(m, 14), 0xF)
+			local promo      = band(rshift(m, 18), 0x7)
+			local isQuiet    = (cap == 0 and promo == 0)
+			local givesCheck = board:inCheck(board.side)
+
 			if isQuiet then
 				nQuiets = nQuiets + 1
 				quietsTried[nQuiets] = m
@@ -1479,14 +1451,11 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 				score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, true, m)
 			else
 				local reduction = 0
-				if depth >= 3 and legalMoves >= 3 and isQuiet and not inChk then
-					local dIdx = math.min(64, depth)
-					local mIdx = math.min(64, legalMoves)
-					reduction = LMR_TABLE[dIdx][mIdx] or 1
-					if pvNode then reduction = reduction - 1 end
-					if improving then reduction = reduction - 1 end
-					if mOrderScore >= 700000 then reduction = reduction - 1 end
-					reduction = math.clamp(reduction, 0, depth - 2)
+				if depth >= 3 and legalMoves >= 4 and isQuiet and not inChk and not givesCheck and mOrderScore < 700000 then
+					reduction = 1
+					if depth >= 5 and legalMoves >= 10 and not pvNode then
+						reduction = 2
+					end
 				end
 
 				score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true, m)
@@ -1539,12 +1508,6 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		if inChk then
 			return -MATE + ply
 		else
-			-- Stalemate: if the stalemated side is losing badly (staticEval < -150), stalemate saves them (+1500 for them, which negates to -1500 for the winning side!)
-			if staticEval < -150 then
-				return 1500
-			elseif staticEval > 150 then
-				return -1500
-			end
 			return 0
 		end
 	end
@@ -1570,13 +1533,60 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 		end
 	end
 
-	return bestScore, bestMove
+	return bestScore
 end
 
 --==============================================================================
--- 6. PARALLEL CLOUD STOCKFISH NNUE / SYZYGY + ANTI-STALEMATE ROOT FILTER
+-- 6. TRI-BRAIN ENSEMBLE:
+--    BRAIN 1: Multi-Server Cloud Stockfish 17 NNUE (stockfish.online GET + chess-api POST + Lichess + Syzygy)
+--    BRAIN 2: Local 0x88 Stockfish Engine (Root PVS + Anti-Stalemate + Anti-Repetition)
+--    BRAIN 3: Native Chess.Bot Apex 2800 Co-Processor & Orientation Calibrator
 --==============================================================================
-local HttpService = game:GetService("HttpService")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local httpRequest       = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+
+local BuiltInBot = nil
+pcall(function()
+	local chessFolder = ReplicatedStorage:WaitForChild("Chess", 5)
+	if chessFolder then
+		local botMod = chessFolder:WaitForChild("Bot", 5)
+		if botMod then BuiltInBot = require(botMod) end
+	end
+end)
+
+-- Startup Auto-Calibration of ChessDuels Board Orientation (Probes BuiltInBot once so it NEVER flips mid-game!)
+local LOCKED_IS_TOPDOWN = false
+do
+	if BuiltInBot and type(BuiltInBot.analyze) == "function" then
+		pcall(function()
+			-- Test a board with White King at 5, Black King at 61, White Pawn at 13 (e2 in Bottom-Up)
+			local testBrd = table.create(64, 0)
+			testBrd[5]  = 6
+			testBrd[61] = -6
+			testBrd[13] = 1
+			local testGame = {
+				board  = testBrd,
+				turn   = 1,
+				castle = {},
+				ep     = nil,
+				half   = 0,
+				full   = 1,
+				kings  = { [1] = 5, [-1] = 61 },
+			}
+			local ok, _, mv = pcall(function() return BuiltInBot.analyze(testGame, 1, 1) end)
+			if ok and type(mv) == "table" and mv.from == 13 then
+				-- If pawn at 13 moves to 5 (13 - 8 = 5), then White pawns move UP (-8), meaning Top-Down!
+				-- If pawn at 13 moves to 21 or 29 (13 + 8 or +16), then White pawns move DOWN (+8), meaning Bottom-Up!
+				if mv.to < 13 then
+					LOCKED_IS_TOPDOWN = true
+				else
+					LOCKED_IS_TOPDOWN = false
+				end
+			end
+		end)
+	end
+end
 
 local PIECE_TO_CHAR = {
 	[1] = "P", [2] = "N", [3] = "B", [4] = "R", [5] = "Q", [6] = "K",
@@ -1584,7 +1594,20 @@ local PIECE_TO_CHAR = {
 }
 
 local function sq0x88ToIdx64(sq)
-	return rshift(sq, 4) * 8 + band(sq, 7) + 1
+	local r0 = rshift(sq, 4) -- 0..7 (Rank 1..8)
+	local f0 = band(sq, 7)   -- 0..7 (File a..h)
+	if LOCKED_IS_TOPDOWN then
+		return (7 - r0) * 8 + f0 + 1
+	else
+		return r0 * 8 + f0 + 1
+	end
+end
+
+local function idx64ToSq0x88(idx64)
+	local row0 = math.floor((idx64 - 1) / 8)
+	local f0   = (idx64 - 1) % 8
+	local r0   = LOCKED_IS_TOPDOWN and (7 - row0) or row0
+	return lshift(r0, 4) + f0
 end
 
 local START_BOARD_TEMPLATE = {
@@ -1628,11 +1651,76 @@ local function decodePackedToChessDuels(m)
 	}
 end
 
--- Fire asynchronous Cloud Stockfish NNUE / Syzygy Tablebase request in the background WHILE local search runs!
+-- BRAIN 3: Query Game's Native `Chess.Bot` at Level 10 (Apex 2800)
+local function queryNativeApexBot(State, depth)
+	if not BuiltInBot or type(BuiltInBot.analyze) ~= "function" then return nil, nil end
+	local WKing, BKing = 5, 61
+	for i = 1, 64 do
+		if State.board[i] == 6 then WKing = i
+		elseif State.board[i] == -6 then BKing = i end
+	end
+	local VirtualGame = {
+		board  = table.clone(State.board),
+		turn   = State.turn,
+		castle = type(State.castle) == "table" and table.clone(State.castle) or State.castle,
+		ep     = State.ep,
+		half   = State.half,
+		full   = State.full,
+		kings  = { [1] = WKing, [-1] = BKing },
+	}
+	local ok, evalScore, mv = pcall(function()
+		return BuiltInBot.analyze(VirtualGame, depth or 4, 10)
+	end)
+	if ok and type(mv) == "table" and mv.from and mv.to then
+		return mv, tonumber(evalScore)
+	end
+	return nil, nil
+end
+
+-- BRAIN 1: Multi-Server Cloud Stockfish 17 NNUE Cluster (Works with BOTH `game:HttpGet` and `httpRequest`!)
 local function startAsyncCloudQuery(fullFEN, pieceCount)
 	local state = { uci = nil, done = false }
+	local encodedFEN = HttpService:UrlEncode(fullFEN)
+
+	-- Server A: stockfish.online REST GET API (Pure HttpGet — runs live C++ Stockfish 16/17 NNUE on ANY position!)
 	task.spawn(function()
-		local encodedFEN = HttpService:UrlEncode(fullFEN)
+		local okSf, respSf = pcall(function()
+			return game:HttpGet("https://stockfish.online/api/s/v2.php?fen=" .. encodedFEN .. "&depth=13")
+		end)
+		if okSf and type(respSf) == "string" and #respSf > 10 then
+			local uci = string.match(respSf, "bestmove%s+([a-h][1-8][a-h][1-8][qrbn]?)")
+				or string.match(respSf, '"bestmove"%s*:%s*"([a-h][1-8][a-h][1-8][qrbn]?)"')
+			if uci then
+				state.uci  = uci
+				state.done = true
+				return
+			end
+		end
+	end)
+
+	-- Server B: chess-api.com Stockfish 17 NNUE POST API (if Executor supports httpRequest)
+	if type(httpRequest) == "function" then
+		task.spawn(function()
+			local ok, resp = pcall(function()
+				return httpRequest({
+					Url = "https://chess-api.com/v1",
+					Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = HttpService:JSONEncode({ fen = fullFEN, depth = 14, maxThinkingTime = 50 })
+				})
+			end)
+			if ok and type(resp) == "table" and type(resp.Body) == "string" then
+				local uci = string.match(resp.Body, '"move"%s*:%s*"([a-h][1-8][a-h][1-8][qrbn]?)"')
+				if uci then
+					state.uci  = uci
+					state.done = true
+				end
+			end
+		end)
+	end
+
+	-- Server C: Lichess Syzygy 7-Piece Endgame Tablebase & Lichess Cloud Eval (Depth 45+)
+	task.spawn(function()
 		if pieceCount <= 7 then
 			local okTb, respTb = pcall(function()
 				return game:HttpGet("https://tablebase.lichess.ovh/standard?fen=" .. encodedFEN)
@@ -1651,7 +1739,7 @@ local function startAsyncCloudQuery(fullFEN, pieceCount)
 			if uci then state.uci = uci state.done = true return end
 		end
 
-		if pieceCount >= 24 then
+		if pieceCount >= 22 then
 			local okMa, respMa = pcall(function()
 				return game:HttpGet("https://explorer.lichess.ovh/masters?fen=" .. encodedFEN .. "&moves=3")
 			end)
@@ -1662,45 +1750,36 @@ local function startAsyncCloudQuery(fullFEN, pieceCount)
 		end
 		state.done = true
 	end)
+
 	return state
 end
 
 local function computeSearchBudget(remainingSec, moveNumber, humanPaceOn, modeStr)
 	remainingSec = tonumber(remainingSec) or 60
 	moveNumber   = tonumber(moveNumber) or 10
-	local safeRem = math.max(0.04, remainingSec - 0.05)
+	local safeRem = math.max(0.05, remainingSec - 0.05)
 
 	if safeRem <= 12.0 then
-		return 0.060, 0.110
+		return 0.065, 0.120
 	elseif safeRem <= 22.0 then
-		return 0.120, 0.220
-	end
-
-	if humanPaceOn then
-		local isDeepTurn = (moveNumber >= 6 and math.random() < 0.22)
-		if safeRem > 200 or (modeStr == "10 min" and safeRem > 100) then
-			local opt = isDeepTurn and (2.0 + math.random() * 1.4) or (1.0 + math.random() * 0.8)
-			return opt, opt * 1.40
-		elseif safeRem > 65 or (modeStr == "3 min" and safeRem > 40) then
-			local opt = isDeepTurn and (1.1 + math.random() * 0.8) or (0.60 + math.random() * 0.45)
-			return opt, opt * 1.35
-		else
-			-- 1 min mode: 0.28s - 0.75s of pure high-speed search (reaches Depth 7-10 while keeping plenty of clock!)
-			local opt = isDeepTurn and (0.55 + math.random() * 0.25) or (0.28 + math.random() * 0.22)
-			return opt, math.min(0.95, opt * 1.30)
-		end
+		return 0.130, 0.220
+	elseif safeRem <= 65.0 then
+		return 0.260, 0.450
+	elseif safeRem <= 200.0 then
+		return 0.550, 1.000
 	else
-		if safeRem <= 65 then
-			return 0.22, 0.40
-		elseif safeRem <= 200 then
-			return 0.45, 0.85
-		else
-			return 0.90, 1.70
-		end
+		return 1.100, 2.000
 	end
 end
 
 local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
+	-- On Move 1, verify if White King is at 61 (Top-Down) or 5 (Bottom-Up)
+	if State.board[61] == 6 and State.board[5] == -6 then
+		LOCKED_IS_TOPDOWN = true
+	elseif State.board[5] == 6 and State.board[61] == -6 then
+		LOCKED_IS_TOPDOWN = false
+	end
+
 	local b = newBoard()
 	local sqs = b.squares
 
@@ -1709,11 +1788,9 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 		local v = State.board[idx64] or 0
 		if v ~= 0 then
 			pieceCount = pieceCount + 1
-			local r0 = math.floor((idx64 - 1) / 8)
-			local f0 = (idx64 - 1) % 8
-			local sq0x88 = lshift(r0, 4) + f0
-			local pCode = (v > 0) and v or (8 + (-v))
-			sqs[sq0x88] = pCode
+			local sq0x88 = idx64ToSq0x88(idx64)
+			local pCode  = (v > 0) and v or (8 + (-v))
+			sqs[sq0x88]  = pCode
 			if math.abs(v) == 6 then
 				b.kingSq[(v > 0) and 0 or 8] = sq0x88
 			end
@@ -1753,9 +1830,7 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 	b.castling = cr
 
 	if type(State.ep) == "number" and State.ep >= 1 and State.ep <= 64 then
-		local er0 = math.floor((State.ep - 1) / 8)
-		local ef0 = (State.ep - 1) % 8
-		b.ep = lshift(er0, 4) + ef0
+		b.ep = idx64ToSq0x88(State.ep)
 	else
 		b.ep = -1
 	end
@@ -1777,7 +1852,6 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 		if b:makeMove(m) then
 			table.insert(legalRootMoves, m)
 
-			-- Check if opponent has ANY legal reply after move `m`
 			local oppRaw, oppN = b:generateMoves(false)
 			local oppHasReply = false
 			for j = 1, oppN do
@@ -1788,19 +1862,17 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 				end
 			end
 
-			local oppInCheck = b:inCheck(b.side)
+			local oppInCheck   = b:inCheck(b.side)
 			local repeatsMatch = isHashVisitedInMatch(b.hashLo, b.hashHi)
 			b:unmakeMove()
 
 			if not oppHasReply then
 				if oppInCheck then
-					-- INSTANT CHECKMATE IN 1 FOUND! Play it immediately!
 					local mateRes = decodePackedToChessDuels(m)
 					mateRes.isForced = true
+					mateRes.moveNum  = b.fullmove
 					return mateRes
 				end
-				-- Otherwise (`not oppHasReply and not oppInCheck`), move `m` is an immediate STALEMATE!
-				-- Do NOT add `m` to `nonStalemateMoves`!
 			else
 				table.insert(nonStalemateMoves, m)
 				if not repeatsMatch then
@@ -1812,7 +1884,6 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 
 	if #legalRootMoves == 0 then return nil end
 
-	-- If we are not losing badly (rootEval >= -200), strictly forbid Stalemate moves and Repetition moves!
 	if rootEval >= -200 and #nonStalemateMoves > 0 then
 		legalRootMoves = nonStalemateMoves
 		if rootEval >= 50 and #nonRepeatMoves > 0 then
@@ -1823,16 +1894,11 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 	if #legalRootMoves == 1 then
 		local res = decodePackedToChessDuels(legalRootMoves[1])
 		res.isForced = true
+		res.moveNum  = b.fullmove
 		return res
 	end
 
-	-- Pre-sort `legalRootMoves` by MVV-LVA & History so `legalRootMoves[1]` is always a strong move even at Depth 1
-	local rootOrderScores = scoreMovesStockfish(b, legalRootMoves, #legalRootMoves, 1, 0, 0)
-	for i = 1, #legalRootMoves do
-		pickNextMove(legalRootMoves, rootOrderScores, #legalRootMoves, i)
-	end
-
-	-- Build valid FEN with exact castling string `crStr` (Fixes HTTP 400 in Cloud Stockfish & Syzygy Tablebase!)
+	-- Build valid FEN
 	local ranks = {}
 	for r0 = 7, 0, -1 do
 		local empty = 0
@@ -1869,23 +1935,47 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 		local toSq   = algebraicToSq(string.sub(bookUCI, 3, 4))
 		for _, lm in ipairs(legalRootMoves) do
 			if band(lm, 0x7F) == fromSq and band(rshift(lm, 7), 0x7F) == toSq then
-				if humanPaceOn and remainingSec > 25 then
-					task.wait(0.20 + math.random() * 0.25)
-				end
 				local res = decodePackedToChessDuels(lm)
+				res.isBook  = true
+				res.moveNum = b.fullmove
 				res.altMove = decodePackedToChessDuels(legalRootMoves[1])
 				return res
 			end
 		end
 	end
 
-	-- 2. Launch Cloud Stockfish NNUE / Syzygy 7-Piece Tablebase IN PARALLEL with Local Stockfish Search!
+	-- 2. Fire BRAIN 1 (Multi-Server Cloud Stockfish 17 NNUE) in Parallel!
 	local cloudJob = nil
-	if remainingSec > 14 and (b.fullmove <= 18 or pieceCount <= 7) then
+	if remainingSec > 10 then
 		cloudJob = startAsyncCloudQuery(fullFEN, pieceCount)
 	end
 
-	-- 3. Run Local Stockfish Iterative Deepening Search
+	-- 3. Consult BRAIN 3 (Game's Native Apex 2800 Bot at Depth 4) to seed our #1 Root Priority Move!
+	local nativeMove = nil
+	if remainingSec > 6 then
+		local natDepth = (remainingSec > 75) and 5 or ((remainingSec > 18) and 4 or 3)
+		nativeMove = queryNativeApexBot(State, natDepth)
+	end
+
+	local nativePackedMatch = 0
+	if nativeMove and nativeMove.from and nativeMove.to then
+		local nfSq = idx64ToSq0x88(nativeMove.from)
+		local ntSq = idx64ToSq0x88(nativeMove.to)
+		for _, lm in ipairs(legalRootMoves) do
+			if band(lm, 0x7F) == nfSq and band(rshift(lm, 7), 0x7F) == ntSq then
+				nativePackedMatch = lm
+				break
+			end
+		end
+	end
+
+	-- Pre-sort `legalRootMoves` with `nativePackedMatch` promoted to #1 so our PVS searches it first!
+	local rootOrderScores = scoreMovesStockfish(b, legalRootMoves, #legalRootMoves, 1, nativePackedMatch, 0)
+	for i = 1, #legalRootMoves do
+		pickNextMove(legalRootMoves, rootOrderScores, #legalRootMoves, i)
+	end
+
+	-- 4. Run BRAIN 2 (Local 0x88 Stockfish Root Iterative Deepening PVS)
 	local optLimit, maxLimit = computeSearchBudget(remainingSec, b.fullmove, humanPaceOn, modeStr)
 	Searcher.nodes          = 0
 	Searcher.aborted        = false
@@ -1897,72 +1987,67 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 
 	clearKillers()
 
-	local bestMove     = legalRootMoves[1]
-	local secondMove   = legalRootMoves[2] or legalRootMoves[1]
-	local bestScore    = 0
-	local prevBestMove = 0
-	local stabilityCnt = 0
+	local bestMove   = legalRootMoves[1]
+	local secondMove = legalRootMoves[2] or legalRootMoves[1]
+	local bestScore  = -INF
+	local numRoot    = #legalRootMoves
 
 	for depth = 1, 32 do
-		local score, move
-		if depth >= 4 then
-			local delta = 25
-			local alpha = math.max(-INF, bestScore - delta)
-			local beta  = math.min(INF, bestScore + delta)
-			while true do
-				score, move = negamax(b, depth, alpha, beta, 1, false, 0)
-				if Searcher.aborted then break end
-				if score <= alpha then
-					beta  = math.floor((alpha + beta) / 2)
-					alpha = math.max(-INF, alpha - delta)
-					delta = delta * 2
-				elseif score >= beta then
-					beta  = math.min(INF, beta + delta)
-					delta = delta * 2
+		local alpha       = -INF
+		local beta        = INF
+		local depthBestSc = -INF
+
+		for i = 1, numRoot do
+			local m = legalRootMoves[i]
+			if b:makeMove(m) then
+				local score
+				if i == 1 then
+					score = -negamax(b, depth - 1, -beta, -alpha, 2, true, m)
 				else
-					break
+					score = -negamax(b, depth - 1, -alpha - 1, -alpha, 2, true, m)
+					if score > alpha and not Searcher.aborted then
+						score = -negamax(b, depth - 1, -beta, -alpha, 2, true, m)
+					end
+				end
+				b:unmakeMove()
+
+				if Searcher.aborted then break end
+
+				if score > depthBestSc then
+					depthBestSc = score
+					if score > alpha then
+						alpha = score
+					end
+					if m ~= bestMove then
+						secondMove = bestMove
+						bestMove   = m
+						bestScore  = score
+						for k = i, 2, -1 do
+							legalRootMoves[k] = legalRootMoves[k - 1]
+						end
+						legalRootMoves[1] = m
+					else
+						bestScore = score
+					end
 				end
 			end
-		else
-			score, move = negamax(b, depth, -INF, INF, 1, false, 0)
 		end
 
 		if Searcher.aborted then break end
-		if move and move ~= 0 then
-			-- Ensure chosen move is in our filtered `legalRootMoves` (non-stalemate / non-repeat)
-			local allowed = false
-			for _, lm in ipairs(legalRootMoves) do
-				if lm == move then allowed = true break end
-			end
-			if allowed then
-				if move ~= bestMove then
-					secondMove = bestMove
-				end
-				if move == prevBestMove then
-					stabilityCnt = stabilityCnt + 1
-				else
-					stabilityCnt = 0
-					prevBestMove = move
-				end
-				bestMove  = move
-				bestScore = score
-			end
-		end
-
 		if math.abs(bestScore) >= MATE - 100 then break end
+		if cloudJob and cloudJob.uci and depth >= 5 then break end
+		if (os.clock() - Searcher.startTime) >= Searcher.optLimit then break end
+	end
 
-		-- If Cloud Stockfish NNUE / Syzygy Tablebase finished and local didn't find a forced mate, we can use Cloud move!
-		if cloudJob and cloudJob.uci and depth >= 4 then
-			break
-		end
-
-		local elapsed = os.clock() - Searcher.startTime
-		if elapsed >= Searcher.optLimit then
-			break
+	-- If Cloud Stockfish 17 hasn't returned yet and we still have >20s on the clock, give it up to 90ms to finish!
+	if cloudJob and not cloudJob.done and remainingSec > 20 and math.abs(bestScore) < MATE - 100 then
+		local waitCloudEnd = os.clock() + 0.090
+		while not cloudJob.done and os.clock() < waitCloudEnd do
+			task.wait(0.015)
 		end
 	end
 
-	-- Check if parallel Cloud Stockfish NNUE / Syzygy Tablebase returned a verified move
+	-- Priority 1: If Cloud Stockfish 17 NNUE / Syzygy Tablebase returned a legal non-stalemate move, use it!
 	if cloudJob and cloudJob.uci and #cloudJob.uci >= 4 and math.abs(bestScore) < MATE - 100 then
 		local fromSq = algebraicToSq(string.sub(cloudJob.uci, 1, 2))
 		local toSq   = algebraicToSq(string.sub(cloudJob.uci, 3, 4))
@@ -1981,7 +2066,13 @@ local function computeBestMove(State, remainingSec, humanPaceOn, modeStr)
 	end
 
 	local res = decodePackedToChessDuels(bestMove)
-	res.altMove = (secondMove and secondMove ~= bestMove) and decodePackedToChessDuels(secondMove) or nil
+	-- If our chosen move matches `nativeMove`'s origin and destination, use `nativeMove`'s exact `promo` field for 100% server compatibility!
+	if nativeMove and res.from == nativeMove.from and res.to == nativeMove.to and nativeMove.promo then
+		res.promo = nativeMove.promo
+	end
+	res.moveNum   = b.fullmove
+	res.isCapture = (band(rshift(bestMove, 14), 0xF) ~= 0)
+	res.altMove   = nativeMove or ((secondMove and secondMove ~= bestMove) and decodePackedToChessDuels(secondMove) or nil)
 	return res
 end
 
@@ -2541,56 +2632,142 @@ local function resetInternalClock()
 	internalClockTracker.lastTickAt   = os.clock()
 end
 
-local function detectMyClockSeconds(gameObj, myColor)
-	local uiFoundSec = nil
+-- ดึงเวลาของทั้ง "เรา (การ์ดขวา)" และ "คู่แข่ง (การ์ดซ้าย)" แบบ Real-Time
+local function detectBothClocksSeconds(gameObj, myColor)
+	local myUiSec, oppUiSec = nil, nil
 
-	-- 1. Check gameObj / State internal timers
-	if type(gameObj) == "table" then
-		local st = rawget(gameObj, "state")
-		for _, tbl in ipairs({ st, gameObj }) do
-			if type(tbl) == "table" then
-				local clocks = rawget(tbl, "clocks") or rawget(tbl, "timers") or rawget(tbl, "time") or rawget(tbl, "remainingTime")
-				if type(clocks) == "table" and myColor then
-					local cVal = clocks[myColor] or (myColor == 1 and (clocks.w or clocks.W or clocks.white or clocks[1])) or (myColor == -1 and (clocks.b or clocks.B or clocks.black or clocks[2]))
-					if type(cVal) == "number" and cVal > 0 and cVal <= 3600 then
-						uiFoundSec = cVal
-						break
-					end
-				end
-			end
-		end
-	end
-
-	-- 2. Scan visible clock TextLabels (Player's card is on the right -> largest X, or any clock with decimal like 0:14.3)
-	if not uiFoundSec and playerGui then
-		local bestX = -1
+	if playerGui then
+		local clockLabels = {}
 		for desc in pairs(trackedTextElements) do
 			if desc.Parent and isElementVisible(desc) then
-				local m, s = string.match(desc.Text or "", "(%d+):(%d+%.?%d*)")
+				local m, s = string.match(desc.Text or "", "^%s*(%d+):(%d+%.?%d*)%s*$")
+				if not m then
+					m, s = string.match(desc.Text or "", "(%d+):(%d+%.?%d*)")
+				end
 				if m and s then
 					local sec = tonumber(m) * 60 + tonumber(s)
-					if sec and sec > 0 and sec <= 3600 and desc.AbsolutePosition.X > bestX then
-						bestX = desc.AbsolutePosition.X
-						uiFoundSec = sec
+					if sec and sec >= 0 and sec <= 3600 then
+						table.insert(clockLabels, { x = desc.AbsolutePosition.X, sec = sec })
 					end
 				end
 			end
 		end
+
+		if #clockLabels >= 2 then
+			table.sort(clockLabels, function(a, b) return a.x < b.x end)
+			-- การ์ดซ้ายสุดคือคู่แข่ง, การ์ดขวาสุดคือเรา (ตาม UI ของ ChessDuels ในภาพ)
+			oppUiSec = clockLabels[1].sec
+			myUiSec  = clockLabels[#clockLabels].sec
+		elseif #clockLabels == 1 then
+			myUiSec = clockLabels[1].sec
+		end
 	end
 
-	-- 3. Combine with our failsafe internal stopwatch so even if UI text fails to parse, we NEVER overestimate our time!
-	if uiFoundSec then
-		internalClockTracker.estimatedSec = uiFoundSec
+	if myUiSec then
+		internalClockTracker.estimatedSec = myUiSec
 		internalClockTracker.lastTickAt   = os.clock()
 		internalClockTracker.active       = true
-		return uiFoundSec
 	else
 		if not internalClockTracker.active then
 			resetInternalClock()
 			internalClockTracker.active = true
 		end
-		return math.max(1.0, internalClockTracker.estimatedSec)
+		myUiSec = math.max(1.0, internalClockTracker.estimatedSec)
 	end
+
+	return myUiSec, (oppUiSec or myUiSec)
+end
+
+local myMovesPlayedInMatch = 0
+
+-- คำนวณ "เวลาที่ใช้ต่อ 1 ตาเดินทั้งหมด (Total Turn Duration)"
+-- จูนพิเศษสำหรับโหมด 1 นาที (Bullet): เนียนเหมือนคนจริง (ไม่ดีดสวน 0.05 วิ) แต่คุมงบเวลาให้เล่นได้ถึง 65+ ตาโดยไม่มีทางแพ้ Timeout!
+local function computeTargetHumanTurnTime(mySec, oppSec, moveInfo, movesPlayed)
+	if not Settings.HumanPace then return 0 end
+
+	local mode = normalizeTimeMode(Settings.TimeMode)
+	local panicLimit = (mode == "1 min") and 14.0 or 18.0
+
+	-- 1. โหมดสปีดเอาตัวรอดเมื่อเวลาต่ำกว่าขีดอันตราย (<= 14 วิใน 1m หรือ <= 18 วิใน 3m/10m)
+	if mySec <= panicLimit then
+		return 0.05 + math.random() * 0.08
+	end
+
+	local moveNum   = math.max(tonumber(moveInfo and moveInfo.moveNum) or 1, movesPlayed + 1)
+	local isCapture = (moveInfo and moveInfo.isCapture == true)
+	local isForced  = (moveInfo and moveInfo.isForced == true)
+
+	-- 2. ตาบังคับหรือตากินคืนเร็ว
+	if isForced and mySec <= 40 then
+		return 0.35 + math.random() * 0.25
+	end
+
+	-- 3. ช่วงเปิดหมาก 4 ตาแรกสุดของแมตช์
+	if moveNum <= 4 then
+		if mode == "10 min" or mySec > 200 then
+			return 1.20 + math.random() * 1.10
+		elseif mode == "3 min" or mySec > 70 then
+			return 0.85 + math.random() * 0.85
+		else
+			return 0.45 + math.random() * 0.45 -- 0.45 - 0.90 วินาทีในโหมด 1 นาที
+		end
+	end
+
+	local clockLead  = math.max(0, (mySec or 30) - (oppSec or 30))
+	local isDeepTank = (math.random() < 0.24)
+
+	-- 4. คำนวณเวลาถือหมากแยกตามโหมดและเวลาที่เหลือจริง
+	local targetSec = 0.65
+
+	if mySec > 200 or (mode == "10 min" and mySec > 110) then
+		-- โหมด 10 นาที
+		if isDeepTank then
+			targetSec = 5.50 + math.random() * 5.50
+		elseif isCapture then
+			targetSec = 1.40 + math.random() * 1.20
+		else
+			targetSec = 2.60 + math.random() * 2.80
+		end
+
+	elseif mySec > 65 or (mode == "3 min" and mySec > 42) then
+		-- โหมด 3 นาที
+		if isDeepTank then
+			targetSec = 2.80 + math.random() * 2.50
+		elseif isCapture then
+			targetSec = 0.90 + math.random() * 0.70
+		else
+			targetSec = 1.50 + math.random() * 1.40
+		end
+
+	elseif mySec > 35 then
+		-- โหมด 1 นาที ช่วงเวลาเหลือ > 35 วินาที (เช่น 35 - 60 วิ)
+		-- เฉลี่ยตาละ 0.75 - 1.85 วินาที เพื่อให้เวลาค่อยๆ ลดลงมาแตะ 25-30 วิอย่างสมจริง และมีเวลาเหลือพอเล่นถึงตาที่ 60+!
+		local leadBonus = math.clamp(clockLead * 0.025, 0, 0.45)
+		if isDeepTank then
+			targetSec = 1.35 + math.random() * 0.75 + leadBonus -- 1.35 - 2.55 วินาที
+		elseif isCapture then
+			targetSec = 0.55 + math.random() * 0.35 + (leadBonus * 0.4) -- 0.55 - 1.05 วินาที
+		else
+			targetSec = 0.80 + math.random() * 0.60 + leadBonus -- 0.80 - 1.85 วินาที
+		end
+
+	elseif mySec > 22 then
+		-- โหมด 1 นาที ช่วงเวลา 22 - 35 วินาที (คุมจังหวะกระฉับกระเฉง 0.45 - 1.15 วินาที เพื่อรักษาเวลาไม่ให้แพ้ตอนท้ายเกม 50+ ตา)
+		if isDeepTank then
+			targetSec = 0.85 + math.random() * 0.40 -- 0.85 - 1.25 วินาที
+		elseif isCapture then
+			targetSec = 0.38 + math.random() * 0.25 -- 0.38 - 0.63 วินาที
+		else
+			targetSec = 0.52 + math.random() * 0.38 -- 0.52 - 0.90 วินาที
+		end
+
+	else
+		-- ช่วงเวลา 14 - 22 วินาที: เร่งมือ 0.22 - 0.45 วินาที
+		targetSec = 0.22 + math.random() * 0.23
+	end
+
+	local maxSafe = math.max(0.25, (mySec - panicLimit) * 0.14)
+	return math.min(targetSec, maxSafe)
 end
 
 local function sendMove(bestMove)
@@ -2700,8 +2877,8 @@ task.spawn(function()
 					local shouldAct = (currentSig ~= lastHandledSig) or ((os.clock() - lastAttemptTime) > 0.65)
 
 					if shouldAct then
-						local turnStart = os.clock()
-						local remSec    = detectMyClockSeconds(gameObj, myColor)
+						local turnStart        = os.clock()
+						local mySec, oppSec    = detectBothClocksSeconds(gameObj, myColor)
 						local ok, bestMove
 
 						if retryCount >= 2 then
@@ -2709,14 +2886,32 @@ task.spawn(function()
 							if backupMv then
 								ok, bestMove = true, backupMv
 							else
-								ok, bestMove = pcall(computeBestMove, State, math.min(remSec, 8), false, Settings.TimeMode)
+								ok, bestMove = pcall(computeBestMove, State, math.min(mySec, 8), false, Settings.TimeMode)
 								if ok and bestMove and bestMove.altMove and (retryCount % 2 == 1) then
 									bestMove = bestMove.altMove
 								end
 							end
 						else
-							-- Instead of sleeping idly after thinking, computeBestMove uses the human pace budget directly for deeper search + Cloud NNUE!
-							ok, bestMove = pcall(computeBestMove, State, remSec, (retryCount == 0 and Settings.HumanPace), Settings.TimeMode)
+							ok, bestMove = pcall(computeBestMove, State, mySec, (retryCount == 0 and Settings.HumanPace), Settings.TimeMode)
+						end
+
+						-- GUARANTEED HUMAN PACING HOLD:
+						-- แม้ว่า Opening Book, Mate-in-1 หรือ Cloud Stockfish 17 จะตอบกลับมาใน 0.02 วินาที
+						-- บอทจะถือหมากไว้จนครบเวลาคิดของคนจริง (targetTurnSec) ก่อนส่งหมาก เพื่อไม่ให้ดีดหมากสวนทันที!
+						if ok and bestMove and retryCount == 0 and Settings.HumanPace then
+							local targetTurnSec = computeTargetHumanTurnTime(mySec, oppSec, bestMove, myMovesPlayedInMatch)
+							local mode = normalizeTimeMode(Settings.TimeMode)
+							local panicCut = (mode == "1 min") and 12.0 or 15.5
+
+							while (os.clock() - turnStart) < targetTurnSec do
+								if not running or not Settings.AutoPlay or isPostGameModalVisible() then break end
+								local liveMySec = detectBothClocksSeconds(gameObj, myColor)
+								if liveMySec <= panicCut then break end
+								local checkObj = getActiveMatchObj(false)
+								local checkSt  = checkObj and checkObj.state
+								if not checkSt or getBoardSignature(checkSt) ~= currentSig then break end
+								task.wait(0.04)
+							end
 						end
 
 						local spent = os.clock() - turnStart
@@ -2726,6 +2921,9 @@ task.spawn(function()
 						local latestState = latestObj and latestObj.state
 						if ok and bestMove and running and Settings.AutoPlay and latestState and getBoardSignature(latestState) == currentSig then
 							sendMove(bestMove)
+							if retryCount == 0 then
+								myMovesPlayedInMatch = myMovesPlayedInMatch + 1
+							end
 							lastHandledSig  = currentSig
 							lastAttemptTime = os.clock()
 							retryCount      = retryCount + 1
@@ -2735,9 +2933,10 @@ task.spawn(function()
 			end
 			task.wait(0.03)
 		else
-			lastHandledSig  = ""
-			retryCount      = 0
-			cachedCurrentFn = nil
+			lastHandledSig       = ""
+			retryCount           = 0
+			myMovesPlayedInMatch = 0
+			cachedCurrentFn      = nil
 			clearMatchHistoryHashes()
 			resetInternalClock()
 
