@@ -1,12 +1,12 @@
 --!native
 --!optimize 2
 --[[
-    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (STOCKFISH BRAIN + REAL-TIME HUMAN PACING)
-    - รู้เวลาแบบ Real-Time ทั้งจากหน่วยความจำเกมและตัวเลขนาฬิกาบนหน้าจอ (รองรับ 0:14.3, 3:00, 10:00)
-    - ระบบ Smart Human Pacing:
-        * ช่วงเปิดเกม (ตาที่ 1-7 หรืออยู่ใน Opening Book): เดินไวเป็นธรรมชาติ (0.16 - 0.44 วินาที)
-        * ช่วงกลางเกม: ถ้าเวลาเหลือเยอะและกระดานซับซ้อน จะทั้งคิดลึกขึ้นและชะลอทำท่าคิดเหมือนคนจริง
-        * ช่วงเวลาใกล้หมด (Time Scramble < 18-25 วินาที): ตัดการหน่วงเวลาทั้งหมดเป็น 0.00s แล้วสปีดเต็มสูบทันที!
+    SILL X | SOLO 2800+ UNIVERSAL AUTO BOT (ZERO-FREEZE WATCHDOG EDITION)
+    - แก้บั๊กเล่นๆ อยู่แล้วบอทหยุดเดินกลางเกม 100%:
+        1. ล็อกพิกัดตาราง State.board[1..64] เป็นมาตรฐานเดียวกับเซิร์ฟเวอร์ (ตัด detectTopDownBoard ที่เคยพลิกกลับด้านกระดานผิดตอนหมากบุกเข้าแดนศัตรูกลางเกม)
+        2. ปลดล็อกขีดจำกัด retryCount < 4 (ที่เดิมถ้าเน็ตกระตุกหรือติดอนิเมชันครบ 4 ครั้ง บอทจะหยุดเดินถาวร)
+        3. เพิ่มระบบ Tiered Recovery Watchdog: หากยิงตาเดินหลักไปแล้วเซิร์ฟเวอร์ยังไม่ขยับภายใน 2 ครั้ง ครั้งถัดไปจะสลับใช้ตาเดินสำรอง (Alt Move / BuiltIn Validator) อัตโนมัติทันที!
+        4. รีเฟรชตัวชี้กระดานใน GC ทุก 1 วินาที เพื่อไม่ให้ค้างที่กระดานเก่าตอนกด Rematch เริ่มเกมใหม่
 ]]
 
 local __SOLO_2800_PAYLOAD = [===[
@@ -1008,34 +1008,72 @@ end
 --==============================================================================
 -- 4. STOCKFISH TIMEMAN.CPP (Optimum & Maximum Time + Instability Scaling)
 --==============================================================================
+-- ประเมินจำนวนตาเดินจริงจากสภาพกระดาน (แก้ปัญหา State.full เป็น nil หรือค้างที่ 1 ใน ChessDuels)
+local START_BOARD_TEMPLATE = {
+	 4,  2,  3,  5,  6,  3,  2,  4,
+	 1,  1,  1,  1,  1,  1,  1,  1,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	-1, -1, -1, -1, -1, -1, -1, -1,
+	-4, -2, -3, -5, -6, -3, -2, -4,
+}
+
+local function estimateTrueMoveNumber(State, isTopDown)
+	local rawFull = tonumber(State.full) or tonumber(State.fullmove) or tonumber(State.moveCount)
+	if rawFull and rawFull > 1 then
+		return rawFull
+	end
+	if type(State.history) == "table" and #State.history > 0 then
+		return math.floor(#State.history / 2) + 1
+	end
+	if type(State.moves) == "table" and #State.moves > 0 then
+		return math.floor(#State.moves / 2) + 1
+	end
+
+	-- นับจำนวนช่องที่เปลี่ยนไปจากตำแหน่งเริ่มต้น + ตัวหมากที่ถูกกิน
+	local changed = 0
+	local pieceCount = 0
+	for idx64 = 1, 64 do
+		local v = State.board[idx64] or 0
+		if v ~= 0 then pieceCount = pieceCount + 1 end
+		local row0 = math.floor((idx64 - 1) / 8)
+		local f0   = (idx64 - 1) % 8
+		local r0   = isTopDown and (7 - row0) or row0
+		local stdIdx = r0 * 8 + f0 + 1
+		if v ~= START_BOARD_TEMPLATE[stdIdx] then
+			changed = changed + 1
+		end
+	end
+	local captured = math.max(0, 32 - pieceCount)
+	local estFull = math.floor(changed / 3.2) + captured + 1
+	return math.clamp(estFull, 1, 60)
+end
+
 local function computeStockfishTime(remainingSec, moveNumber)
 	remainingSec = tonumber(remainingSec) or 60
 	moveNumber   = tonumber(moveNumber) or 10
 	local safeRem = math.max(0.04, remainingSec - 0.040)
 
-	-- Emergency (< 5s left)
 	if safeRem < 5.0 then
 		return math.clamp(safeRem * 0.035, 0.015, 0.045), math.clamp(safeRem * 0.09, 0.025, 0.080)
-	-- Low clock (< 18s left, like 0:14.3 in screenshot!)
-	elseif safeRem <= 18.0 then
-		return math.clamp(safeRem * 0.045, 0.030, 0.090), math.clamp(safeRem * 0.12, 0.055, 0.160)
-	-- 1 min Bullet (<= 65s)
+	elseif safeRem <= 15.0 then
+		return math.clamp(safeRem * 0.045, 0.030, 0.085), math.clamp(safeRem * 0.11, 0.055, 0.150)
 	elseif safeRem <= 65.0 then
-		local mtg = math.max(22, 38 - math.floor(moveNumber * 0.35))
+		local mtg = math.max(20, 36 - math.floor(moveNumber * 0.35))
 		local opt = safeRem / mtg
-		return math.clamp(opt, 0.050, 0.260), math.clamp(opt * 2.1, 0.090, 0.500)
-	-- 3 min Blitz (<= 200s)
+		return math.clamp(opt, 0.080, 0.420), math.clamp(opt * 2.2, 0.140, 0.750)
 	elseif safeRem <= 200.0 then
 		local mtg = math.max(18, 34 - math.floor(moveNumber * 0.3))
 		local opt = safeRem / mtg
-		if moveNumber >= 10 and moveNumber <= 24 then opt = opt * 1.18 end
-		return math.clamp(opt, 0.150, 1.150), math.clamp(opt * 2.4, 0.280, 2.300)
-	-- 10 min Rapid (> 200s)
+		if moveNumber >= 8 and moveNumber <= 24 then opt = opt * 1.25 end
+		return math.clamp(opt, 0.220, 1.450), math.clamp(opt * 2.4, 0.400, 2.600)
 	else
 		local mtg = math.max(16, 30 - math.floor(moveNumber * 0.25))
 		local opt = safeRem / mtg
-		if moveNumber >= 10 and moveNumber <= 28 then opt = opt * 1.22 end
-		return math.clamp(opt, 0.350, 3.200), math.clamp(opt * 2.6, 0.700, 6.500)
+		if moveNumber >= 8 and moveNumber <= 28 then opt = opt * 1.30 end
+		return math.clamp(opt, 0.450, 3.600), math.clamp(opt * 2.6, 0.900, 7.000)
 	end
 end
 
@@ -1475,50 +1513,79 @@ local function negamax(board, depth, alpha, beta, ply, allowNull, prevMove)
 end
 
 --==============================================================================
--- 6. AUTO-ORIENTATION MAPPER (Handles both a1..h8 and a8..h1 State.board layouts!)
+-- 6. EXACT CHESSDUELS 1..64 MAPPER + MULTI-CHOICE FALLBACK (ZERO MID-GAME FREEZE)
 --==============================================================================
 local PIECE_TO_CHAR = {
 	[1] = "P", [2] = "N", [3] = "B", [4] = "R", [5] = "Q", [6] = "K",
 	[-1] = "p", [-2] = "n", [-3] = "b", [-4] = "r", [-5] = "q", [-6] = "k",
 }
 
--- Detect whether State.board[1..8] is Rank 1 (White home) or Rank 8 (Black home)
-local function detectTopDownBoard(boardArr)
-	local wBottom, bBottom = 0, 0
-	for i = 1, 16 do
-		local v = boardArr[i] or 0
-		if v > 0 then wBottom = wBottom + 1
-		elseif v < 0 then bBottom = bBottom + 1 end
-	end
-	for i = 49, 64 do
-		local v = boardArr[i] or 0
-		if v < 0 then wBottom = wBottom + 1
-		elseif v > 0 then bBottom = bBottom + 1 end
-	end
-	return (bBottom > wBottom)
-end
-
-local function sq0x88ToIdx64(sq, isTopDown)
+-- In ChessDuels, State.board[1..64] ALWAYS maps 1..8 = Rank 1 (a1..h1) and 57..64 = Rank 8 (a8..h8)
+local function sq0x88ToIdx64(sq)
 	local r0 = rshift(sq, 4) -- 0..7 (Rank 1..8)
 	local f0 = band(sq, 7)   -- 0..7 (File a..h)
-	if isTopDown then
-		return (7 - r0) * 8 + f0 + 1
-	else
-		return r0 * 8 + f0 + 1
+	return r0 * 8 + f0 + 1
+end
+
+local START_BOARD_TEMPLATE = {
+	 4,  2,  3,  5,  6,  3,  2,  4,
+	 1,  1,  1,  1,  1,  1,  1,  1,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	-1, -1, -1, -1, -1, -1, -1, -1,
+	-4, -2, -3, -5, -6, -3, -2, -4,
+}
+
+local function estimateTrueMoveNumber(State)
+	local rawFull = tonumber(State.full) or tonumber(State.fullmove) or tonumber(State.moveCount)
+	if rawFull and rawFull > 1 then
+		return rawFull
 	end
+	if type(State.history) == "table" and #State.history > 0 then
+		return math.floor(#State.history / 2) + 1
+	end
+	if type(State.moves) == "table" and #State.moves > 0 then
+		return math.floor(#State.moves / 2) + 1
+	end
+
+	local changed = 0
+	local pieceCount = 0
+	for idx64 = 1, 64 do
+		local v = State.board[idx64] or 0
+		if v ~= 0 then pieceCount = pieceCount + 1 end
+		if v ~= START_BOARD_TEMPLATE[idx64] then
+			changed = changed + 1
+		end
+	end
+	local captured = math.max(0, 32 - pieceCount)
+	local estFull = math.floor(changed / 3.2) + captured + 1
+	return math.clamp(estFull, 1, 60)
+end
+
+local function decodePackedToChessDuels(m, isWhiteTurn)
+	local from0x88  = band(m, 0x7F)
+	local to0x88    = band(rshift(m, 7), 0x7F)
+	local promoCode = band(rshift(m, 18), 0x7)
+	-- In ChessDuels, Queen=5, Rook=4, Bishop=3, Knight=2 (or 0 if no promotion)
+	local promoVal  = (promoCode ~= 0) and promoCode or 0
+	return {
+		from  = sq0x88ToIdx64(from0x88),
+		to    = sq0x88ToIdx64(to0x88),
+		promo = promoVal,
+	}
 end
 
 local function computeBestMove(State, remainingSec)
 	local b = newBoard()
 	local sqs = b.squares
-	local isTopDown = detectTopDownBoard(State.board)
 
 	for idx64 = 1, 64 do
 		local v = State.board[idx64] or 0
 		if v ~= 0 then
-			local row0 = math.floor((idx64 - 1) / 8)
-			local f0   = (idx64 - 1) % 8
-			local r0   = isTopDown and (7 - row0) or row0
+			local r0 = math.floor((idx64 - 1) / 8)
+			local f0 = (idx64 - 1) % 8
 			local sq0x88 = lshift(r0, 4) + f0
 			local pCode = (v > 0) and v or (8 + (-v))
 			sqs[sq0x88] = pCode
@@ -1531,8 +1598,9 @@ local function computeBestMove(State, remainingSec)
 	local isWhiteTurn = (State.turn == 1 or State.turn == "w" or State.turn == "White" or State.turn == true)
 	b.side     = isWhiteTurn and WHITE or BLACK
 	b.halfmove = tonumber(State.half) or 0
-	b.fullmove = tonumber(State.full) or 1
+	b.fullmove = estimateTrueMoveNumber(State)
 
+	-- Parse Castling Rights safely (also verify King and Rook are actually on their starting squares!)
 	local cr = 0
 	if type(State.castle) == "table" then
 		local cw = State.castle[1] or State.castle.w or State.castle.W
@@ -1546,24 +1614,42 @@ local function computeBestMove(State, remainingSec)
 			if cb.q or cb.Q or cb[2] then cr = bor(cr, 8) end
 		end
 		if cr == 0 then
-			if State.castle.K or State.castle.wk then cr = bor(cr, 1) end
-			if State.castle.Q or State.castle.wq then cr = bor(cr, 2) end
-			if State.castle.k or State.castle.bk then cr = bor(cr, 4) end
-			if State.castle.q or State.castle.bq then cr = bor(cr, 8) end
+			if State.castle.K or State.castle.wk or State.castle[1] == true then cr = bor(cr, 1) end
+			if State.castle.Q or State.castle.wq or State.castle[2] == true then cr = bor(cr, 2) end
+			if State.castle.k or State.castle.bk or State.castle[3] == true then cr = bor(cr, 4) end
+			if State.castle.q or State.castle.bq or State.castle[4] == true then cr = bor(cr, 8) end
 		end
 	end
+	-- Strictly verify King & Rook positions so we never generate an illegal castle
+	if sqs[4] ~= (WHITE + KING) then cr = band(cr, 15 - 3) end
+	if sqs[7] ~= (WHITE + ROOK) then cr = band(cr, 15 - 1) end
+	if sqs[0] ~= (WHITE + ROOK) then cr = band(cr, 15 - 2) end
+	if sqs[116] ~= (BLACK + KING) then cr = band(cr, 15 - 12) end
+	if sqs[119] ~= (BLACK + ROOK) then cr = band(cr, 15 - 4) end
+	if sqs[112] ~= (BLACK + ROOK) then cr = band(cr, 15 - 8) end
 	b.castling = cr
 
 	if type(State.ep) == "number" and State.ep >= 1 and State.ep <= 64 then
-		local erow0 = math.floor((State.ep - 1) / 8)
-		local ef0   = (State.ep - 1) % 8
-		local er0   = isTopDown and (7 - erow0) or erow0
+		local er0 = math.floor((State.ep - 1) / 8)
+		local ef0 = (State.ep - 1) % 8
 		b.ep = lshift(er0, 4) + ef0
 	else
 		b.ep = -1
 	end
 
 	b:recomputeState()
+
+	-- Generate all legal root moves first
+	local rawMoves, n = b:generateMoves(false)
+	local legalRootMoves = {}
+	for i = 1, n do
+		if b:makeMove(rawMoves[i]) then
+			table.insert(legalRootMoves, rawMoves[i])
+			b:unmakeMove()
+		end
+	end
+
+	if #legalRootMoves == 0 then return nil end
 
 	-- Build FEN key for GM Opening Book
 	local ranks = {}
@@ -1585,22 +1671,21 @@ local function computeBestMove(State, remainingSec)
 	end
 	local fenKey = table.concat(ranks, "/") .. " " .. (isWhiteTurn and "w" or "b")
 
-	-- 1. Probe GM Opening Book (0.00s instant response)
-	local bookUCI = probeBook(fenKey)
+	-- 1. Probe GM Opening Book (match against actual legalRootMoves so it is 100% legal!)
+	local bookUCI = (b.fullmove <= 5) and probeBook(fenKey) or nil
 	if bookUCI and #bookUCI >= 4 then
 		local fromSq = algebraicToSq(string.sub(bookUCI, 1, 2))
 		local toSq   = algebraicToSq(string.sub(bookUCI, 3, 4))
-		if fromSq ~= -1 and toSq ~= -1 and b:makeMove(packMove(fromSq, toSq, sqs[toSq], 0, (sqs[toSq] ~= 0) and 1 or 0)) then
-			b:unmakeMove()
-			return {
-				from       = sq0x88ToIdx64(fromSq, isTopDown),
-				to         = sq0x88ToIdx64(toSq, isTopDown),
-				promo      = 0,
-				isBook     = true,
-				isForced   = false,
-				complexity = 1,
-				moveNum    = b.fullmove,
-			}
+		for _, lm in ipairs(legalRootMoves) do
+			if band(lm, 0x7F) == fromSq and band(rshift(lm, 7), 0x7F) == toSq then
+				local res = decodePackedToChessDuels(lm, isWhiteTurn)
+				res.isBook     = true
+				res.isForced   = false
+				res.complexity = 1
+				res.moveNum    = b.fullmove
+				res.altMove    = (#legalRootMoves > 1) and decodePackedToChessDuels(legalRootMoves[1], isWhiteTurn) or nil
+				return res
+			end
 		end
 	end
 
@@ -1615,23 +1700,12 @@ local function computeBestMove(State, remainingSec)
 
 	clearKillers()
 
-	local rawMoves, n = b:generateMoves(false)
-	local legalRootMoves = {}
-	for i = 1, n do
-		if b:makeMove(rawMoves[i]) then
-			table.insert(legalRootMoves, rawMoves[i])
-			b:unmakeMove()
-		end
-	end
-
-	if #legalRootMoves == 0 then return nil end
-
 	local bestMove     = legalRootMoves[1]
+	local secondMove   = legalRootMoves[2] or legalRootMoves[1]
 	local bestScore    = 0
 	local prevBestMove = 0
 	local stabilityCnt = 0
 
-	-- 2. Stockfish Iterative Deepening with Aspiration Windows & Instability Time Scaling
 	if #legalRootMoves > 1 then
 		for depth = 1, 32 do
 			local score, move
@@ -1659,6 +1733,9 @@ local function computeBestMove(State, remainingSec)
 
 			if Searcher.aborted then break end
 			if move and move ~= 0 then
+				if move ~= bestMove then
+					secondMove = bestMove
+				end
 				if move == prevBestMove then
 					stabilityCnt = stabilityCnt + 1
 				else
@@ -1671,7 +1748,6 @@ local function computeBestMove(State, remainingSec)
 
 			if math.abs(bestScore) >= MATE - 100 then break end
 
-			-- Stockfish Dynamic Time Scaling: stop earlier if bestMove is stable for 3+ depths!
 			local stabilityFactor = (stabilityCnt >= 3) and 0.50 or ((stabilityCnt == 0 and depth >= 5) and 0.90 or 0.68)
 			if (os.clock() - Searcher.startTime) >= Searcher.optLimit * stabilityFactor then
 				break
@@ -1679,33 +1755,27 @@ local function computeBestMove(State, remainingSec)
 		end
 	end
 
-	local from0x88  = band(bestMove, 0x7F)
-	local to0x88    = band(rshift(bestMove, 7), 0x7F)
-	local promoCode = band(rshift(bestMove, 18), 0x7)
-
 	local isCaptureMove = (band(rshift(bestMove, 14), 0xF) ~= 0)
 	local complexity = 2
 	if #legalRootMoves == 1 then
 		complexity = 0
-	elseif stabilityCnt == 0 and #legalRootMoves >= 20 then
-		complexity = 3 -- High complexity / tactical position where best move shifted
-	elseif isCaptureMove and stabilityCnt >= 2 then
-		complexity = 1 -- Obvious recapture
+	elseif stabilityCnt <= 1 or (#legalRootMoves >= 26 and b.phase >= 12) then
+		complexity = 3
+	elseif isCaptureMove and stabilityCnt >= 3 then
+		complexity = 1
 	end
 
-	return {
-		from       = sq0x88ToIdx64(from0x88, isTopDown),
-		to         = sq0x88ToIdx64(to0x88, isTopDown),
-		promo      = (promoCode ~= 0) and promoCode or 0,
-		isBook     = false,
-		isForced   = (#legalRootMoves == 1),
-		complexity = complexity,
-		moveNum    = b.fullmove,
-	}
+	local res = decodePackedToChessDuels(bestMove, isWhiteTurn)
+	res.isBook     = false
+	res.isForced   = (#legalRootMoves == 1)
+	res.complexity = complexity
+	res.moveNum    = b.fullmove
+	res.altMove    = (secondMove and secondMove ~= bestMove) and decodePackedToChessDuels(secondMove, isWhiteTurn) or nil
+	return res
 end
 
 --==============================================================================
--- 7. ROBLOX CLIENT INTEGRATION (FIXED IN-GAME DETECTOR + DUAL GC SCANNER)
+-- 7. ROBLOX CLIENT INTEGRATION (NEVER-STUCK WATCHDOG + BUILT-IN BOT BACKUP)
 --==============================================================================
 if not game:IsLoaded() then
 	game.Loaded:Wait()
@@ -1722,6 +1792,42 @@ local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
 	task.wait(0.2)
 	LocalPlayer = Players.LocalPlayer
+end
+
+local PlayMove = ReplicatedStorage:WaitForChild("ChessRemotes"):WaitForChild("Action")
+local BuiltInBot = nil
+pcall(function()
+	local chessFolder = ReplicatedStorage:WaitForChild("Chess", 5)
+	if chessFolder then
+		local botMod = chessFolder:WaitForChild("Bot", 5)
+		if botMod then BuiltInBot = require(botMod) end
+	end
+end)
+
+-- Emergency Backup: If our move is ever rejected by the server on retry >= 2, ask the game's own Bot module for a 100% server-compatible move!
+local function computeBackupMoveFromGameModule(State)
+	if not BuiltInBot or type(BuiltInBot.analyze) ~= "function" then return nil end
+	local WKing, BKing = 5, 61
+	for i = 1, 64 do
+		if State.board[i] == 6 then WKing = i
+		elseif State.board[i] == -6 then BKing = i end
+	end
+	local VirtualGame = {
+		board  = table.clone(State.board),
+		turn   = State.turn,
+		castle = type(State.castle) == "table" and table.clone(State.castle) or State.castle,
+		ep     = State.ep,
+		half   = State.half,
+		full   = State.full,
+		kings  = { [1] = WKing, [-1] = BKing },
+	}
+	local ok, _, mv = pcall(function()
+		return BuiltInBot.analyze(VirtualGame, 4, 10)
+	end)
+	if ok and type(mv) == "table" and mv.from and mv.to then
+		return mv
+	end
+	return nil
 end
 
 local createdScreenGui = nil
@@ -1762,7 +1868,7 @@ purgeLegacyUIs()
 
 local Settings = {
 	AutoPlay   = true,
-	HumanPace  = true, -- ระบบเนียนปรับจังหวะเดินตามเวลาเรียลไทม์ (ต้นเกมไว -> กลางเกมมีเวลาเหลือทำท่าคิด -> เวลาใกล้หมดสปีดเต็มสูบ)
+	HumanPace  = true,
 	AutoQueue  = true,
 	TimeMode   = "1 min",
 }
@@ -1834,7 +1940,7 @@ end)
 
 local Window = (okUI and SilL) and SilL:CreateWindow({
 	Name = "Sill X | Solo 2800+ Bot ♟️",
-	Subtitle = "Stockfish Brain • 1m / 3m / 10m Auto",
+	Subtitle = "Stockfish Brain • Anti-Freeze Watchdog",
 	Theme = "Ocean",
 	ToggleKey = Enum.KeyCode.RightShift,
 	Size = UDim2.fromOffset(500, 340),
@@ -1974,56 +2080,56 @@ local function selectDesiredTimeMode()
 	end
 end
 
--- DUAL GC + FILTERGC MATCH DISCOVERY (Never misses active gameObj!)
-local PlayMove = ReplicatedStorage:WaitForChild("ChessRemotes"):WaitForChild("Action")
-local cachedCurrentFns = {}
-local lastGcScanTime = 0
+-- Periodic Fresh GC Scanner so a new match / Rematch never gets stuck on an old cached closure!
+local cachedCurrentFn = nil
+local lastGcScanTime  = 0
 
-local function getActiveMatchObj()
-	for i = #cachedCurrentFns, 1, -1 do
-		local ok, obj = pcall(cachedCurrentFns[i])
-		if ok and type(obj) == "table" and obj.state and type(obj.state.board) == "table" then
-			if not (rawget(obj, "ended") == true or rawget(obj.state, "ended") == true) then
-				return obj
-			end
+local function isValidActiveGameObj(obj)
+	if type(obj) ~= "table" then return false end
+	local st = rawget(obj, "state")
+	if type(st) ~= "table" or type(rawget(st, "board")) ~= "table" then return false end
+	if rawget(obj, "ended") == true or rawget(st, "ended") == true or rawget(obj, "gameOver") == true or rawget(st, "gameOver") == true then
+		return false
+	end
+	if rawget(obj, "winner") ~= nil or rawget(st, "winner") ~= nil or rawget(st, "result") ~= nil then
+		return false
+	end
+	return true
+end
+
+local function getActiveMatchObj(forceRescan)
+	local now = os.clock()
+	if not forceRescan and cachedCurrentFn and (now - lastGcScanTime) < 1.0 then
+		local ok, obj = pcall(cachedCurrentFn)
+		if ok and isValidActiveGameObj(obj) then
+			return obj
 		end
+		cachedCurrentFn = nil
 	end
 
-	if os.clock() - lastGcScanTime < 0.45 then return nil end
-	lastGcScanTime = os.clock()
+	lastGcScanTime = now
 
-	-- 1. Try filtergc("function", { Name = "current" })
 	if type(filtergc) == "function" then
 		local ok, found = pcall(function() return filtergc("function", { Name = "current" }) end)
 		if ok and type(found) == "table" then
-			cachedCurrentFns = found
 			for i = #found, 1, -1 do
-				local s, obj = pcall(found[i])
-				if s and type(obj) == "table" and obj.state and type(obj.state.board) == "table" then
-					if not (rawget(obj, "ended") == true or rawget(obj.state, "ended") == true) then
-						return obj
-					end
+				local fn = found[i]
+				local s, obj = pcall(fn)
+				if s and isValidActiveGameObj(obj) then
+					cachedCurrentFn = fn
+					return obj
 				end
 			end
 		end
 	end
 
-	-- 2. Fallback: Direct getgc(true) table scan for { state = { board = { [64] } } }
 	if type(getgc) == "function" then
 		local ok, gcList = pcall(getgc, true)
 		if ok and type(gcList) == "table" then
 			for i = #gcList, 1, -1 do
 				local v = gcList[i]
-				if type(v) == "table" then
-					local st = rawget(v, "state")
-					if type(st) == "table" then
-						local brd = rawget(st, "board")
-						if type(brd) == "table" and brd[64] ~= nil then
-							if not (rawget(v, "ended") == true or rawget(st, "ended") == true) then
-								return v
-							end
-						end
-					end
+				if isValidActiveGameObj(v) and v.state.board[64] ~= nil then
+					return v
 				end
 			end
 		end
@@ -2032,37 +2138,10 @@ local function getActiveMatchObj()
 	return nil
 end
 
+-- Strict Post-Game Modal check (only exact button texts "rematch", "new game", "game review" so chat/usernames never trigger false positives!)
 local function isPostGameModalVisible()
-	local postBtns = findVisibleElementsByText({
-		"new game", "rematch", "you won", "you lost", "game review",
-		"by resignation", "by checkmate", "by timeout", "by abandonment"
-	}, false)
+	local postBtns = findVisibleElementsByText({ "rematch", "new game", "game review" }, true)
 	return #postBtns > 0
-end
-
-local lastQueueAction = 0
-local function executeLobbyOrPostGameClick(screenState)
-	if os.clock() - lastQueueAction < 2.8 then return end
-	lastQueueAction = os.clock()
-	selectDesiredTimeMode()
-	task.wait(0.20)
-	if screenState == "POSTGAME" then
-		local postTargets = findVisibleElementsByText({ "new game", "play again" }, false)
-		for _, el in ipairs(postTargets) do clickGuiElement(el) task.wait(0.12) end
-	elseif screenState == "LOBBY" then
-		selectDesiredTimeMode()
-		task.wait(0.20)
-		local playNowTargets = findVisibleElementsByText({ "play now" }, true)
-		for _, el in ipairs(playNowTargets) do clickGuiElement(el) task.wait(0.12) end
-	end
-end
-
-local function getBoardSignature(State)
-	local parts = table.create(66)
-	parts[1] = tostring(State.turn)
-	parts[2] = tostring(State.full or 0)
-	for i = 1, 64 do parts[i + 2] = tostring(State.board[i] or 0) end
-	return table.concat(parts, ",")
 end
 
 local function matchesLocalPlayer(val)
@@ -2079,6 +2158,125 @@ local function matchesLocalPlayer(val)
 		end
 	end
 	return false
+end
+
+local lastOpponentInfo = { name = nil, userId = nil }
+
+local function updateOpponentFromGameObj(gameObj)
+	if type(gameObj) ~= "table" then return end
+	for _, tbl in ipairs({ gameObj, gameObj.state }) do
+		if type(tbl) == "table" then
+			local w = rawget(tbl, "white") or rawget(tbl, "White") or rawget(tbl, "whitePlayer")
+			local b = rawget(tbl, "black") or rawget(tbl, "Black") or rawget(tbl, "blackPlayer")
+			for _, pVal in ipairs({ w, b }) do
+				if pVal and not matchesLocalPlayer(pVal) then
+					if typeof(pVal) == "Instance" and pVal:IsA("Player") then
+						lastOpponentInfo.name   = pVal.Name
+						lastOpponentInfo.userId = pVal.UserId
+						return
+					elseif type(pVal) == "string" and #pVal > 1 and pVal ~= LocalPlayer.Name then
+						lastOpponentInfo.name = pVal
+						return
+					elseif type(pVal) == "number" and pVal ~= LocalPlayer.UserId then
+						lastOpponentInfo.userId = pVal
+						return
+					elseif type(pVal) == "table" then
+						local nm = rawget(pVal, "Name") or rawget(pVal, "name") or rawget(pVal, "username")
+						local id = rawget(pVal, "UserId") or rawget(pVal, "userId") or rawget(pVal, "id")
+						if nm and nm ~= LocalPlayer.Name then lastOpponentInfo.name = nm end
+						if id and id ~= LocalPlayer.UserId then lastOpponentInfo.userId = id end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function hasOpponentLeftOrDeclined()
+	local declinedMsgs = findVisibleElementsByText({
+		"declined", "opponent left", "player left", "disconnected",
+		"left the game", "rematch declined", "unavailable", "cancelled", "canceled"
+	}, false)
+	if #declinedMsgs > 0 then return true end
+
+	if lastOpponentInfo.userId or lastOpponentInfo.name then
+		local stillInServer = false
+		for _, p in ipairs(Players:GetPlayers()) do
+			if (lastOpponentInfo.userId and p.UserId == lastOpponentInfo.userId)
+				or (lastOpponentInfo.name and string.lower(p.Name) == string.lower(lastOpponentInfo.name))
+			then
+				stillInServer = true
+				break
+			end
+		end
+		if not stillInServer then return true end
+	end
+	return false
+end
+
+local postGamePhase = {
+	rematchClickedAt = 0,
+	newGameLastClick = 0,
+}
+
+local function resetPostGamePhase()
+	postGamePhase.rematchClickedAt = 0
+	postGamePhase.newGameLastClick = 0
+end
+
+local lastQueueAction = 0
+local function executeLobbyOrPostGameClick(screenState)
+	local now = os.clock()
+
+	if screenState == "POSTGAME" then
+		local rematchBtns = findVisibleElementsByText({ "rematch" }, true)
+		local opponentGone = hasOpponentLeftOrDeclined()
+
+		if postGamePhase.rematchClickedAt == 0 and not opponentGone and #rematchBtns > 0 then
+			postGamePhase.rematchClickedAt = now
+			for _, el in ipairs(rematchBtns) do
+				clickGuiElement(el)
+				task.wait(0.12)
+			end
+			return
+		end
+
+		local waitedSec = (postGamePhase.rematchClickedAt > 0) and (now - postGamePhase.rematchClickedAt) or 999
+		if not opponentGone and waitedSec < 10.0 and #rematchBtns > 0 then
+			return
+		end
+
+		if (now - postGamePhase.newGameLastClick) < 2.5 then return end
+		postGamePhase.newGameLastClick = now
+
+		selectDesiredTimeMode()
+		task.wait(0.20)
+		local newGameTargets = findVisibleElementsByText({ "new game", "play again", "play now" }, false)
+		for _, el in ipairs(newGameTargets) do
+			clickGuiElement(el)
+			task.wait(0.12)
+		end
+
+	elseif screenState == "LOBBY" then
+		if (now - lastQueueAction) < 2.8 then return end
+		lastQueueAction = now
+		resetPostGamePhase()
+		selectDesiredTimeMode()
+		task.wait(0.20)
+		local playNowTargets = findVisibleElementsByText({ "play now" }, true)
+		for _, el in ipairs(playNowTargets) do
+			clickGuiElement(el)
+			task.wait(0.12)
+		end
+	end
+end
+
+local function getBoardSignature(State)
+	local parts = table.create(66)
+	parts[1] = tostring(State.turn)
+	parts[2] = tostring(State.full or 0)
+	for i = 1, 64 do parts[i + 2] = tostring(State.board[i] or 0) end
+	return table.concat(parts, ",")
 end
 
 local function getMyColor(gameObj)
@@ -2121,9 +2319,7 @@ local function isMyTurnNow(State, myColor)
 	return false
 end
 
--- อ่านเวลาที่เหลือแบบ Real-Time ทั้งจากโครงสร้างเกม (State.time / clocks) และจากตัวเลขนาฬิกาบนหน้าจอ (รองรับทศนิยม เช่น 0:14.3)
 local function detectMyClockSeconds(gameObj, myColor)
-	-- 1. ลองดึงจากตารางสถานะเกมโดยตรงถ้ามีเก็บวินาทีแบบเรียลไทม์
 	if type(gameObj) == "table" then
 		local st = rawget(gameObj, "state")
 		for _, tbl in ipairs({ st, gameObj }) do
@@ -2139,7 +2335,6 @@ local function detectMyClockSeconds(gameObj, myColor)
 		end
 	end
 
-	-- 2. ดึงจาก TextLabel นาฬิกาฝั่งผู้เล่นบนหน้าจอแบบ Real-Time (การ์ดผู้เล่นอยู่ฝั่งขวา ค่า X มากกว่า)
 	if playerGui then
 		local bestX = -1
 		local foundSec = nil
@@ -2162,59 +2357,96 @@ local function detectMyClockSeconds(gameObj, myColor)
 	return map[Settings.TimeMode] or 60
 end
 
--- คำนวณเวลารอ "ทำท่าคิดเหมือนคนจริง" (Adaptive Human Pacing) ตามช่วงเกมและเวลาที่เหลือจริงบนนาฬิกา
+local myMovesInCurrentMatch = 0
+
 local function computeHumanThinkDelay(remSec, moveInfo, thinkElapsedSec)
 	if not Settings.HumanPace then return 0 end
-	if not moveInfo or moveInfo.isForced then return 0 end
+	if not moveInfo then return 0 end
 
-	-- 1. โหมดฉุกเฉิน / เวลาใกล้หมด (Time Scramble): เล่นเร็วทันที ห้ามหน่วงเวลาเด็ดขาด!
-	if remSec <= 18.0 then
+	local mode = normalizeTimeMode(Settings.TimeMode)
+	local panicThreshold = (mode == "1 min") and 11.0 or 15.0
+	if remSec <= panicThreshold then
 		return 0
 	end
 
-	local moveNum    = tonumber(moveInfo.moveNum) or 10
+	if moveInfo.isForced then
+		if remSec <= 20.0 then return 0 end
+		local forcedPause = (mode == "10 min") and (0.85 + math.random() * 0.75)
+			or ((mode == "3 min") and (0.55 + math.random() * 0.55) or (0.38 + math.random() * 0.35))
+		return math.max(0, forcedPause - thinkElapsedSec)
+	end
+
+	local moveNum    = math.max(tonumber(moveInfo.moveNum) or 1, myMovesInCurrentMatch + 1)
 	local isBook     = (moveInfo.isBook == true)
 	local complexity = tonumber(moveInfo.complexity) or 2
 
-	-- 2. ช่วงเปิดเกม (ตาที่ 1 - 7 หรืออยู่ใน Opening Book): เดินไหลลื่นเร็วเหมือนคนจำหมากเปิดได้
-	if isBook or moveNum <= 7 then
-		local target = 0.16 + math.random() * 0.28 -- 0.16s .. 0.44s
-		return math.max(0, target - thinkElapsedSec)
+	local isDeepTankTurn = (moveNum >= 5 and math.random() < 0.28)
+	if isDeepTankTurn then
+		complexity = math.max(complexity, 3)
 	end
 
-	-- 3. ช่วงกลางเกม & ท้ายเกม: เช็กว่ามีเวลาเหลือเฟือไหม
-	local targetTotal = 0
-	if remSec > 180 then
-		-- เวลาเหลือเยอะระดับโหมด 10 นาที (> 3 นาทีบนนาฬิกา)
-		if complexity >= 3 then
-			targetTotal = 1.60 + math.random() * 2.20 -- ตาซับซ้อน คิด 1.6 - 3.8 วินาที
-		elseif complexity == 2 then
-			targetTotal = 0.85 + math.random() * 1.15 -- ตาปกติ คิด 0.85 - 2.0 วินาที
+	if isBook or moveNum <= 4 then
+		local openWait
+		if mode == "10 min" or remSec > 200 then
+			openWait = 1.40 + math.random() * 1.80
+		elseif mode == "3 min" or remSec > 70 then
+			openWait = 0.95 + math.random() * 1.25
 		else
-			targetTotal = 0.35 + math.random() * 0.45 -- ตากินคืนง่ายๆ 0.35 - 0.8 วินาที
+			openWait = 0.65 + math.random() * 0.75
 		end
-	elseif remSec > 55 then
-		-- เวลาเหลือสบายๆ ระดับโหมด 3 นาที (เหลือ 55 - 180 วินาที)
-		if complexity >= 3 then
-			targetTotal = 0.90 + math.random() * 1.25 -- ตาซับซ้อน คิด 0.9 - 2.15 วินาที
-		elseif complexity == 2 then
-			targetTotal = 0.45 + math.random() * 0.65 -- ตาปกติ คิด 0.45 - 1.10 วินาที
-		else
-			targetTotal = 0.20 + math.random() * 0.25
-		end
-	elseif remSec > 26 then
-		-- เวลาเหลือเกินครึ่งของโหมด 1 นาที (เหลือ 26 - 55 วินาที)
-		if complexity >= 3 then
-			targetTotal = 0.32 + math.random() * 0.42 -- ชะลอทำท่าคิดนิดเดียว 0.32 - 0.74 วินาที
-		elseif complexity == 2 then
-			targetTotal = 0.16 + math.random() * 0.24
-		else
-			targetTotal = 0.08 + math.random() * 0.10
-		end
-	else
-		-- เหลือ 18 - 26 วินาที: เร่งจังหวะให้ไวขึ้นมากเพื่อเซฟเวลา
-		targetTotal = 0.04 + math.random() * 0.08
+		return math.max(0, openWait - thinkElapsedSec)
 	end
+
+	local targetTotal = 0
+
+	if remSec > 210 or (mode == "10 min" and remSec > 120) then
+		if isDeepTankTurn then
+			targetTotal = 9.50 + math.random() * 9.50
+		elseif complexity >= 3 then
+			targetTotal = 5.50 + math.random() * 5.50
+		elseif complexity == 2 then
+			targetTotal = 3.20 + math.random() * 3.30
+		else
+			targetTotal = 1.50 + math.random() * 1.40
+		end
+
+	elseif remSec > 65 or (mode == "3 min" and remSec > 42) then
+		if isDeepTankTurn and remSec > 85 then
+			targetTotal = 5.20 + math.random() * 4.80
+		elseif complexity >= 3 then
+			targetTotal = 3.10 + math.random() * 2.90
+		elseif complexity == 2 then
+			targetTotal = 1.80 + math.random() * 1.80
+		else
+			targetTotal = 0.90 + math.random() * 0.85
+		end
+
+	elseif remSec > 30 then
+		if isDeepTankTurn then
+			targetTotal = 2.60 + math.random() * 1.65
+		elseif complexity >= 3 then
+			targetTotal = 1.85 + math.random() * 1.35
+		elseif complexity == 2 then
+			targetTotal = 1.25 + math.random() * 1.05
+		else
+			targetTotal = 0.65 + math.random() * 0.55
+		end
+
+	elseif remSec > 18 then
+		if complexity >= 3 then
+			targetTotal = 0.95 + math.random() * 0.75
+		elseif complexity == 2 then
+			targetTotal = 0.60 + math.random() * 0.55
+		else
+			targetTotal = 0.35 + math.random() * 0.30
+		end
+
+	else
+		targetTotal = 0.18 + math.random() * 0.25
+	end
+
+	local safeMaxWait = math.max(0.2, (remSec - panicThreshold) * 0.22)
+	targetTotal = math.min(targetTotal, safeMaxWait)
 
 	return math.max(0, targetTotal - thinkElapsedSec)
 end
@@ -2235,7 +2467,7 @@ if Window then
 
 	ControlSection:CreateToggle({
 		Name = "🤖 เดินหมากอัตโนมัติ (Auto Play 100%)",
-		Description = "สมองกล Stockfish Architecture (LMR + SEE + Gravity History) ปรับเวลาอัตโนมัติ",
+		Description = "สมองกล Stockfish Architecture + ระบบกันค้างกลางเกม (Anti-Freeze Watchdog)",
 		CurrentValue = Settings.AutoPlay,
 		Callback = function(Value)
 			Settings.AutoPlay = Value
@@ -2245,7 +2477,7 @@ if Window then
 
 	ControlSection:CreateToggle({
 		Name = "🎭 จังหวะคิดเนียนตามเวลาจริง (Smart Human Pacing)",
-		Description = "ต้นเกมเดินไว กลางเกมถ้าเวลาเหลือเยอะจะชะลอทำท่าคิด ถ้าเวลาใกล้หมดจะสปีดรัวทันที",
+		Description = "เผาเวลาตามโหมด 1m / 3m / 10m อย่างสมจริง และเร่งสปีดเมื่อเวลาใกล้หมด",
 		CurrentValue = Settings.HumanPace,
 		Callback = function(Value)
 			Settings.HumanPace = Value
@@ -2254,8 +2486,8 @@ if Window then
 	})
 
 	ControlSection:CreateToggle({
-		Name = "🔄 กดหาห้อง & เริ่มเกมใหม่อัตโนมัติ (Auto Queue)",
-		Description = "เลือกเวลาและกด Play now / New Game อัตโนมัติเมื่อจบเกม",
+		Name = "🔄 จบเกมกด Rematch (รอ 10 วิ) -> New Game อัตโนมัติ",
+		Description = "จบเกมกด Rematch ก่อน รอ 10 วิ (หรือถ้าคู่แข่งออก/ปฏิเสธ จะกด New Game ทันที)",
 		CurrentValue = Settings.AutoQueue,
 		Callback = function(Value)
 			Settings.AutoQueue = Value
@@ -2294,7 +2526,7 @@ end
 _G.SillChessBotCleanup = ENV.SillChessBotCleanup
 
 --==============================================================================
--- 8. MAIN LOOP (ACTIVE MATCH TAKES PRIORITY OVER BACKGROUND LOBBY BUTTONS!)
+-- 8. MAIN LOOP WITH NEVER-STUCK WATCHDOG & AUTOMATIC FALLBACK RECOVERY
 --==============================================================================
 task.spawn(function()
 	local lastHandledSig = ""
@@ -2304,12 +2536,14 @@ task.spawn(function()
 	while running do
 		purgeLegacyUIs()
 
-		-- 1. ALWAYS check if an active chess match is in progress FIRST!
-		local gameObj = getActiveMatchObj()
-		local State   = gameObj and gameObj.state
 		local postGameModal = isPostGameModalVisible()
+		local gameObj = not postGameModal and getActiveMatchObj(retryCount >= 2) or nil
+		local State   = gameObj and gameObj.state
 
 		if State and State.board and not postGameModal then
+			resetPostGamePhase()
+			updateOpponentFromGameObj(gameObj)
+
 			if Settings.AutoPlay then
 				local myColor = getMyColor(gameObj)
 				if isMyTurnNow(State, myColor) then
@@ -2318,24 +2552,45 @@ task.spawn(function()
 						retryCount = 0
 					end
 
-					local canRetry = (retryCount < 4) and ((os.clock() - lastAttemptTime) > 0.75)
-					if currentSig ~= lastHandledSig or canRetry then
+					-- Never lock out! Retry every 0.70s if the server didn't register the move yet
+					local shouldAct = (currentSig ~= lastHandledSig) or ((os.clock() - lastAttemptTime) > 0.70)
+
+					if shouldAct then
 						local turnStart = os.clock()
 						local remSec    = detectMyClockSeconds(gameObj, myColor)
-						local ok, bestMove = pcall(computeBestMove, State, remSec)
+						local ok, bestMove
+
+						-- Tiered Recovery Watchdog:
+						-- Attempt 0 & 1: Use our primary 2800+ Stockfish Engine move
+						-- Attempt 2+: If server rejected primary move (e.g. special castling/promo state), try game's built-in Bot module or our 2nd best legal move!
+						if retryCount >= 2 then
+							local backupMv = computeBackupMoveFromGameModule(State)
+							if backupMv then
+								ok, bestMove = true, backupMv
+							else
+								ok, bestMove = pcall(computeBestMove, State, math.min(remSec, 10))
+								if ok and bestMove and bestMove.altMove and (retryCount % 2 == 1) then
+									bestMove = bestMove.altMove
+								end
+							end
+						else
+							ok, bestMove = pcall(computeBestMove, State, remSec)
+						end
+
 						local thinkElapsed = os.clock() - turnStart
 
-						-- หากเปิดโหมดจังหวะคนจริง (HumanPace) และไม่ได้เป็นการลองยิงซ้ำ (retryCount == 0)
+						-- Human Pacing only on the first attempt of a turn (retryCount == 0)
 						if ok and bestMove and retryCount == 0 and Settings.HumanPace then
 							local extraWait = computeHumanThinkDelay(remSec, bestMove, thinkElapsed)
 							if extraWait > 0.02 then
+								local mode = normalizeTimeMode(Settings.TimeMode)
+								local panicCut = (mode == "1 min") and 11.0 or 15.0
 								local waitUntil = os.clock() + extraWait
 								while os.clock() < waitUntil do
-									if not running or not Settings.AutoPlay then break end
-									-- เช็กนาฬิกาเรียลไทม์ระหว่างรอ ถ้าเวลาลดต่ำกว่า 18 วิ ให้หยุดรอแล้วเดินทันที!
+									if not running or not Settings.AutoPlay or isPostGameModalVisible() then break end
 									local liveRem = detectMyClockSeconds(gameObj, myColor)
-									if liveRem <= 18.0 then break end
-									local checkObj = getActiveMatchObj()
+									if liveRem <= panicCut then break end
+									local checkObj = getActiveMatchObj(false)
 									local checkSt  = checkObj and checkObj.state
 									if not checkSt or getBoardSignature(checkSt) ~= currentSig then break end
 									task.wait(0.03)
@@ -2343,10 +2598,13 @@ task.spawn(function()
 							end
 						end
 
-						local latestObj   = getActiveMatchObj()
+						local latestObj   = getActiveMatchObj(false)
 						local latestState = latestObj and latestObj.state
 						if ok and bestMove and running and Settings.AutoPlay and latestState and getBoardSignature(latestState) == currentSig then
 							sendMove(bestMove)
+							if retryCount == 0 then
+								myMovesInCurrentMatch = myMovesInCurrentMatch + 1
+							end
 							lastHandledSig  = currentSig
 							lastAttemptTime = os.clock()
 							retryCount      = retryCount + 1
@@ -2356,11 +2614,11 @@ task.spawn(function()
 			end
 			task.wait(0.03)
 		else
-			-- 2. Only when NO active match is running (or Post-Game modal popped up), run Auto-Queue!
-			lastHandledSig = ""
-			retryCount     = 0
+			lastHandledSig        = ""
+			retryCount            = 0
+			myMovesInCurrentMatch = 0
+			cachedCurrentFn       = nil
 			if postGameModal then
-				table.clear(cachedCurrentFns)
 				if Settings.AutoQueue then
 					executeLobbyOrPostGameClick("POSTGAME")
 				end
@@ -2369,7 +2627,7 @@ task.spawn(function()
 					executeLobbyOrPostGameClick("LOBBY")
 				end
 			end
-			task.wait(0.4)
+			task.wait(0.35)
 		end
 	end
 end)
