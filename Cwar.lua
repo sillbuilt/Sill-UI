@@ -14,6 +14,13 @@ workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
 	if workspace.CurrentCamera then camera = workspace.CurrentCamera end
 end)
 
+if type(_G.__CWAR_CLEANUP) == "function" then
+	pcall(_G.__CWAR_CLEANUP)
+end
+pcall(function() RunService:UnbindFromRenderStep("CWAim") end)
+pcall(function() RunService:UnbindFromRenderStep("CWESP") end)
+pcall(function() RunService:UnbindFromRenderStep("CWSpec") end)
+
 _G.__CWAR = (_G.__CWAR or 0) + 1
 local GEN = _G.__CWAR
 
@@ -451,7 +458,10 @@ Players.PlayerRemoving:Connect(function(p) local set = drawn[p] if set then hide
 -- Aim Logic
 local function keyFromName(name) if type(name) ~= "string" then return nil end if name:sub(1, 11) == "MouseButton" then return Enum.UserInputType[name] end return Enum.KeyCode[name] end
 local function hotkeyHeld(name) local k = keyFromName(name) if not k then return false end local ok, held = pcall(function() if k.EnumType == Enum.UserInputType then return UserInputService:IsMouseButtonPressed(k) end return UserInputService:IsKeyDown(k) end) return ok and held or false end
+local Spectate -- Forward declaration for Zone Separation
+
 local function aimActive()
+	if Spectate and Spectate.IsActive and Spectate.IsActive() then return false end
 	if not CONFIG.aim then return false end
 	if CONFIG.aimActive == "Always" then return true end
 	if CONFIG.aimActive == "While firing" then return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end
@@ -524,7 +534,7 @@ local function aimPass(dt)
 		STATE.target, stickyTarget = "-", nil
 	end
 
-	if CONFIG.triggerBot then
+	if CONFIG.triggerBot and not (Spectate and Spectate.IsActive and Spectate.IsActive()) then
 		local targetChar = stickyTarget and stickyTarget.Character
 		if targetChar then
 			local triggerPart = targetChar:FindFirstChild(CONFIG.triggerPart == "Head" and "Head" or "Torso") or targetChar:FindFirstChild("Head")
@@ -566,7 +576,439 @@ local function worldPass()
 end
 
 --------------------------------------------------------------------------------
--- INIT: UI (SilL X UI Integration)
+-- ZONE 2: SPECTATE SYSTEM (HARDENED, ISOLATED & QOL-ENHANCED FOR COLD WAR)
+--------------------------------------------------------------------------------
+Spectate = {}
+
+Spectate.Config = {
+	Sensitivity        = 0.0025,
+	Smoothness         = 14,
+	RotationSmoothness = 12,
+	DefaultDistance    = 14,
+	MinDistance        = 3,
+	MaxDistance        = 65,
+	OrbitSpeed         = 0.45,
+	FilterMode         = "Enemies Only", -- "Enemies Only", "Teammates Only", "All Players"
+	AliveOnly          = true,
+	AutoSwitchOnDeath  = true,
+	WallCollision      = true,
+	ShowHUD            = true,
+	QuickSpecKey       = "V", -- Press V while looking near a player to spectate them
+}
+
+local specActive        = false
+local currentTarget     = nil
+local specMode          = 1 -- 1: Follow, 2: Orbit, 3: First Person
+local currentDist       = Spectate.Config.DefaultDistance
+
+local lookHeld          = false
+local yaw               = 0
+local pitch             = math.rad(-10)
+local targetYaw         = 0
+local targetPitch       = math.rad(-10)
+
+local specFocus         = nil
+local specFPCF          = nil
+local savedCameraType   = nil
+
+local specInputBegan    = nil
+local specInputEnded    = nil
+local specInputChanged  = nil
+local specCamrayParams  = RaycastParams.new()
+specCamrayParams.FilterType = Enum.RaycastFilterType.Exclude
+specCamrayParams.IgnoreWater = true
+
+-- Spectate HUD Drawing Banner (Top-Center of Screen)
+local specHudTitle = make("Text", { Size = 16, Center = true, Outline = true, ZIndex = 4, Color = Color3.fromRGB(90, 225, 255) })
+local specHudSub   = make("Text", { Size = 13, Center = true, Outline = true, ZIndex = 4, Color = Color3.fromRGB(235, 235, 235) })
+
+local function hideSpecHud()
+	if specHudTitle then specHudTitle.Visible = false end
+	if specHudSub then specHudSub.Visible = false end
+end
+
+local function angleDiffSpec(from, to)
+	return math.atan2(math.sin(to - from), math.cos(to - from))
+end
+
+local function smoothAngleSpec(current, target, alpha)
+	return current + angleDiffSpec(current, target) * alpha
+end
+
+-- Get filtered & sorted list of valid Spectate candidates in Cold War
+function Spectate.GetCandidateList()
+	local list = {}
+	local mode = Spectate.Config.FilterMode
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= plr then
+			local passTeam = true
+			if mode == "Enemies Only" then
+				passTeam = isEnemy(p)
+			elseif mode == "Teammates Only" then
+				passTeam = isMate(p)
+			end
+
+			if passTeam then
+				if Spectate.Config.AliveOnly then
+					local ch = liveChar(p)
+					if ch then table.insert(list, p) end
+				else
+					table.insert(list, p)
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.Name:lower() < b.Name:lower()
+	end)
+	return list
+end
+
+function Spectate.GetDropdownNames()
+	local list = Spectate.GetCandidateList()
+	local names = {}
+	for _, p in ipairs(list) do
+		local r = roleOf(p)
+		local tag = isEnemy(p) and "[ENEMY]" or (isMate(p) and "[TEAM]" or "[NEUTRAL]")
+		table.insert(names, string.format("%s %s%s", p.Name, tag, r and (" (" .. r .. ")") or ""))
+	end
+	if #names == 0 then
+		table.insert(names, "- No Players Found -")
+	end
+	return names
+end
+
+local function unbindSpecInputs()
+	if specInputBegan then specInputBegan:Disconnect(); specInputBegan = nil end
+	if specInputEnded then specInputEnded:Disconnect(); specInputEnded = nil end
+	if specInputChanged then specInputChanged:Disconnect(); specInputChanged = nil end
+	if lookHeld then
+		lookHeld = false
+		pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+	end
+end
+
+local function bindSpecInputs()
+	if specInputBegan then return end
+
+	specInputBegan = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if not specActive then return end
+		if not gameProcessed and input.UserInputType == Enum.UserInputType.MouseButton2 then
+			lookHeld = true
+			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition end)
+		end
+	end)
+
+	specInputEnded = UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton2 and lookHeld then
+			lookHeld = false
+			if specActive then
+				pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+			end
+		end
+	end)
+
+	specInputChanged = UserInputService.InputChanged:Connect(function(input, gameProcessed)
+		if not specActive then return end
+
+		if lookHeld and input.UserInputType == Enum.UserInputType.MouseMovement then
+			local delta = UserInputService:GetMouseDelta()
+			targetYaw = targetYaw - (delta.X * Spectate.Config.Sensitivity)
+			targetPitch = math.clamp(
+				targetPitch - (delta.Y * Spectate.Config.Sensitivity),
+				math.rad(-85),
+				math.rad(85)
+			)
+		end
+
+		if not gameProcessed and input.UserInputType == Enum.UserInputType.MouseWheel then
+			local dir = input.Position.Z
+			currentDist = math.clamp(
+				currentDist - (dir * 2.5),
+				Spectate.Config.MinDistance,
+				Spectate.Config.MaxDistance
+			)
+		end
+	end)
+end
+
+local function onSpecRender(dt)
+	if _G.__CWAR ~= GEN or not specActive or not currentTarget then
+		hideSpecHud()
+		return
+	end
+
+	camera = workspace.CurrentCamera
+	if not camera then return end
+
+	-- Verify target is still in server
+	if not currentTarget.Parent or currentTarget.Parent ~= Players then
+		if Spectate.Config.AutoSwitchOnDeath then
+			Spectate.Cycle(1)
+			if not currentTarget or not currentTarget.Parent then
+				Spectate.Stop()
+			end
+		else
+			Spectate.Stop()
+		end
+		return
+	end
+
+	-- Verify target is alive (using Cold War's limb health + ragdoll check)
+	local char, root, hp, maxHp = liveChar(currentTarget)
+	if not char or not root then
+		-- Also check if they are inside a Vehicle in Cold War!
+		local rawChar = currentTarget.Character
+		local rawRoot = rawChar and (rawChar:FindFirstChild("HumanoidRootPart") or rawChar:FindFirstChild("Head"))
+		if rawChar and rawRoot and rawChar:GetAttribute("InVehicle") ~= nil then
+			char, root, hp, maxHp = rawChar, rawRoot, 100, 100
+		elseif Spectate.Config.AutoSwitchOnDeath then
+			local candidates = Spectate.GetCandidateList()
+			if #candidates > 0 and (candidates[1] ~= currentTarget or #candidates > 1) then
+				Spectate.Cycle(1)
+				return
+			else
+				Spectate.Stop()
+				return
+			end
+		else
+			Spectate.Stop()
+			return
+		end
+	end
+
+	local head = char:FindFirstChild("Head")
+
+	if specMode == 2 and not lookHeld then
+		targetYaw = targetYaw + (Spectate.Config.OrbitSpeed * dt)
+	end
+
+	local rotAlpha = 1 - math.exp(-Spectate.Config.RotationSmoothness * dt)
+	yaw   = smoothAngleSpec(yaw, targetYaw, rotAlpha)
+	pitch = pitch + (targetPitch - pitch) * rotAlpha
+
+	local rotation       = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
+	local targetFocusPos = root.Position + Vector3.new(0, 1.6, 0)
+
+	if specFocus then
+		specFocus = specFocus:Lerp(targetFocusPos, 1 - math.exp(-Spectate.Config.Smoothness * dt))
+	else
+		specFocus = targetFocusPos
+	end
+
+	-- Ensure CameraSubject points to target's Humanoid/Head so Roblox streams distant chunks around them!
+	local targetHum = char:FindFirstChildOfClass("Humanoid")
+	if targetHum and camera.CameraSubject ~= targetHum then
+		pcall(function() camera.CameraSubject = targetHum end)
+	end
+
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	if specMode == 3 and (head or root) then
+		local basePart = head or root
+		local firstPersonCF = basePart.CFrame * CFrame.new(0, 0.15, -0.65)
+		if specFPCF then
+			specFPCF = specFPCF:Lerp(firstPersonCF, 1 - math.exp(-22 * dt))
+		else
+			specFPCF = firstPersonCF
+		end
+		camera.CFrame = specFPCF
+		camera.Focus  = specFPCF
+	else
+		local desiredOffset = -(rotation.LookVector * currentDist)
+		local camPos = specFocus + desiredOffset
+
+		-- QoL: Camera Wall-Collision Prevention so camera doesn't clip inside hills/walls
+		if Spectate.Config.WallCollision then
+			local ignoreList = { char, plr.Character }
+			local ignFolder = workspace:FindFirstChild("Ignore")
+			if ignFolder then table.insert(ignoreList, ignFolder) end
+			specCamrayParams.FilterDescendantsInstances = ignoreList
+
+			local hit = workspace:Raycast(specFocus, desiredOffset, specCamrayParams)
+			if hit and hit.Position then
+				local safeDist = math.max(1.5, (hit.Position - specFocus).Magnitude - 0.8)
+				camPos = specFocus - (rotation.LookVector * safeDist)
+			end
+		end
+
+		local camCF = CFrame.new(camPos) * rotation
+		camera.CFrame = camCF
+		camera.Focus  = CFrame.new(specFocus)
+	end
+
+	-- QoL: Render Top-Center Spectate Telemetry HUD
+	if Spectate.Config.ShowHUD and specHudTitle and specHudSub then
+		local vp = camera.ViewportSize
+		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		local distM = myRoot and math.floor((root.Position - myRoot.Position).Magnitude / STUDS_PER_M) or 0
+		local roleStr = roleOf(currentTarget) or "Soldier"
+		local wpnStr  = weaponOf(char) or "Unarmed"
+		local hpPct   = (maxHp and maxHp > 0) and math.floor(math.clamp(hp / maxHp, 0, 1) * 100) or 100
+		local sideTag = isEnemy(currentTarget) and "ENEMY" or (isMate(currentTarget) and "TEAM" or "NEUTRAL")
+		local modeNames = { [1] = "Follow", [2] = "Orbit", [3] = "First-Person" }
+
+		specHudTitle.Text = string.format("🎥 SPECTATING: %s [%s - %s]", currentTarget.DisplayName or currentTarget.Name, sideTag, roleStr)
+		specHudTitle.Position = Vector2.new(vp.X / 2, 42)
+		specHudTitle.Color = isEnemy(currentTarget) and COL.enemy or COL.team
+		specHudTitle.Visible = true
+
+		specHudSub.Text = string.format("HP: %d%%   |   Weapon: %s   |   Dist: %dm   |   Cam: %s   |   [ [ / ] : Next/Prev · Backspace : Exit ]", hpPct, wpnStr, distM, modeNames[specMode] or "Follow")
+		specHudSub.Position = Vector2.new(vp.X / 2, 62)
+		specHudSub.Visible = true
+	else
+		hideSpecHud()
+	end
+end
+
+function Spectate.Start(targetPlayer)
+	if not targetPlayer or targetPlayer == plr then return false end
+	camera = workspace.CurrentCamera
+	if not camera then return false end
+
+	if not specActive then
+		savedCameraType = camera.CameraType
+		bindSpecInputs()
+		pcall(function() RunService:UnbindFromRenderStep("CWSpec") end)
+		RunService:BindToRenderStep("CWSpec", Enum.RenderPriority.Camera.Value + 3, function(dt)
+			pcall(onSpecRender, dt)
+		end)
+	end
+
+	specActive    = true
+	currentTarget = targetPlayer
+	specFocus     = nil
+	specFPCF      = nil
+
+	local character = targetPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root then
+		local look = root.CFrame.LookVector
+		yaw         = math.atan2(-look.X, -look.Z)
+		targetYaw   = yaw
+		pitch       = math.rad(-10)
+		targetPitch = pitch
+		specFocus   = root.Position + Vector3.new(0, 1.6, 0)
+	end
+	return true
+end
+
+function Spectate.Stop()
+	if not specActive then
+		hideSpecHud()
+		return
+	end
+
+	specActive    = false
+	currentTarget = nil
+	specFocus     = nil
+	specFPCF      = nil
+	hideSpecHud()
+
+	pcall(function() RunService:UnbindFromRenderStep("CWSpec") end)
+	unbindSpecInputs()
+
+	camera = workspace.CurrentCamera
+	if camera then
+		-- Always restore current LocalPlayer's live Humanoid (even if LocalPlayer respawned while spectating!)
+		local myChar = plr.Character
+		local myHum  = myChar and myChar:FindFirstChildOfClass("Humanoid")
+		camera.CameraType = Enum.CameraType.Custom
+		if myHum then
+			camera.CameraSubject = myHum
+		end
+	end
+end
+
+function Spectate.Toggle(targetPlayer)
+	if specActive then
+		Spectate.Stop()
+	else
+		if targetPlayer and targetPlayer ~= plr then
+			Spectate.Start(targetPlayer)
+		else
+			Spectate.Cycle(1)
+		end
+	end
+end
+
+function Spectate.Cycle(direction)
+	local players = Spectate.GetCandidateList()
+	if #players == 0 then
+		Spectate.Stop()
+		return nil
+	end
+
+	local currentIndex = 0
+	for i, p in ipairs(players) do
+		if p == currentTarget then
+			currentIndex = i
+			break
+		end
+	end
+
+	local nextIndex = 1
+	if currentIndex == 0 then
+		nextIndex = (direction >= 0) and 1 or #players
+	else
+		nextIndex = ((currentIndex - 1 + direction) % #players) + 1
+	end
+
+	local chosen = players[nextIndex]
+	if chosen then
+		Spectate.Start(chosen)
+	end
+	return chosen
+end
+
+-- QoL: Spectate the player closest to the center of your crosshair!
+function Spectate.SpectateCrosshairTarget()
+	local mid = centre()
+	local bestP, bestDist = nil, math.huge
+	local list = Spectate.GetCandidateList()
+	for _, p in ipairs(list) do
+		local ch, root = liveChar(p)
+		if ch and root then
+			local sp = camera:WorldToViewportPoint(root.Position)
+			if sp.Z > 0 then
+				local px = (Vector2.new(sp.X, sp.Y) - mid).Magnitude
+				if px < bestDist then
+					bestDist = px
+					bestP = p
+				end
+			end
+		end
+	end
+	if bestP then
+		Spectate.Start(bestP)
+		return bestP
+	end
+	return nil
+end
+
+function Spectate.SetMode(mode)
+	if mode == 1 or mode == 2 or mode == 3 then
+		specMode = mode
+		specFPCF = nil
+	end
+end
+
+function Spectate.SetDistance(distance)
+	currentDist = math.clamp(distance, Spectate.Config.MinDistance, Spectate.Config.MaxDistance)
+end
+
+function Spectate.GetTarget()
+	return currentTarget
+end
+
+function Spectate.IsActive()
+	return specActive
+end
+
+_G.ColdWarSpectate = Spectate
+
+--------------------------------------------------------------------------------
+-- ZONE 3: SILL X UI INTEGRATION (ESP · AIMBOT · TRIGGERBOT · SPECTATE · WORLD)
 --------------------------------------------------------------------------------
 
 local UI_URL = "https://raw.githubusercontent.com/sillbuilt/Sill-UI/refs/heads/main/SilL-X-UI.lua?t=" .. tostring(os.time()) .. math.random(1, 1000)
@@ -574,87 +1016,272 @@ local success, SilL = pcall(function() return loadstring(game:HttpGet(UI_URL))()
 
 local win
 if success and SilL then
-    win = SilL:CreateWindow({
-        Name = "Sill X | Combat Suite",
-        Subtitle = "Legit Edition",
-        ToggleKey = Enum.KeyCode.Home,
-        Size = UDim2.fromOffset(600, 450)
-    })
+	win = SilL:CreateWindow({
+		Name = "Sill X | Cold War Suite",
+		Subtitle = "ESP · Aimbot · Spectate System",
+		ToggleKey = Enum.KeyCode.Home,
+		Watermark = true,
+		SettingsTab = true,
+		Size = UDim2.fromOffset(620, 480)
+	})
 
-    -- ✅ TAB 1: ESP
-    local espTab = win:CreateTab("ESP")
-    local espSec = espTab:CreateSection("Visuals")
-    espSec:CreateToggle({ Name = "ESP Master", CurrentValue = CONFIG.esp, Callback = function(v) CONFIG.esp = v end })
-    espSec:CreateToggle({ Name = "Box", CurrentValue = CONFIG.espBox, Callback = function(v) CONFIG.espBox = v end })
-    espSec:CreateToggle({ Name = "Name", CurrentValue = CONFIG.espName, Callback = function(v) CONFIG.espName = v end })
-    espSec:CreateToggle({ Name = "Class", CurrentValue = CONFIG.espClass, Callback = function(v) CONFIG.espClass = v end })
-    espSec:CreateToggle({ Name = "Health Bar", CurrentValue = CONFIG.espHealth, Callback = function(v) CONFIG.espHealth = v end })
-    espSec:CreateToggle({ Name = "Distance & Weapon", CurrentValue = CONFIG.espInfo, Callback = function(v) CONFIG.espInfo = v end })
+	-- ✅ TAB 1: ESP
+	local espTab = win:CreateTab("ESP")
+	local espSec = espTab:CreateSection("Visuals")
+	espSec:CreateToggle({ Name = "ESP Master", CurrentValue = CONFIG.esp, Callback = function(v) CONFIG.esp = v end })
+	espSec:CreateToggle({ Name = "Box", CurrentValue = CONFIG.espBox, Callback = function(v) CONFIG.espBox = v end })
+	espSec:CreateToggle({ Name = "Name", CurrentValue = CONFIG.espName, Callback = function(v) CONFIG.espName = v end })
+	espSec:CreateToggle({ Name = "Class", CurrentValue = CONFIG.espClass, Callback = function(v) CONFIG.espClass = v end })
+	espSec:CreateToggle({ Name = "Health Bar", CurrentValue = CONFIG.espHealth, Callback = function(v) CONFIG.espHealth = v end })
+	espSec:CreateToggle({ Name = "Distance & Weapon", CurrentValue = CONFIG.espInfo, Callback = function(v) CONFIG.espInfo = v end })
 
-    local espFilter = espTab:CreateSection("Filters & Colors")
-    espFilter:CreateToggle({ Name = "Visible Only", CurrentValue = CONFIG.espVisOnly, Callback = function(v) CONFIG.espVisOnly = v end })
-    espFilter:CreateToggle({ Name = "Dim Hidden", CurrentValue = CONFIG.espDimHidden, Callback = function(v) CONFIG.espDimHidden = v end })
-    espFilter:CreateSlider({ Name = "Max Range (m)", Range = {50, 1500}, CurrentValue = CONFIG.espMaxM, Callback = function(v) CONFIG.espMaxM = v end })
-    espFilter:CreateColorPicker({ Name = "Enemy Color", Color = COL.enemy, Callback = function(c) COL.enemy = c end })
-    espFilter:CreateColorPicker({ Name = "Visible Color", Color = COL.visible, Callback = function(c) COL.visible = c end })
+	local espFilter = espTab:CreateSection("Filters & Colors")
+	espFilter:CreateToggle({ Name = "Visible Only", CurrentValue = CONFIG.espVisOnly, Callback = function(v) CONFIG.espVisOnly = v end })
+	espFilter:CreateToggle({ Name = "Dim Hidden", CurrentValue = CONFIG.espDimHidden, Callback = function(v) CONFIG.espDimHidden = v end })
+	espFilter:CreateSlider({ Name = "Max Range (m)", Range = {50, 1500}, CurrentValue = CONFIG.espMaxM, Callback = function(v) CONFIG.espMaxM = v end })
+	espFilter:CreateColorPicker({ Name = "Enemy Color", Color = COL.enemy, Callback = function(c) COL.enemy = c end })
+	espFilter:CreateColorPicker({ Name = "Visible Color", Color = COL.visible, Callback = function(c) COL.visible = c end })
 
-    local vehSec = espTab:CreateSection("Vehicles")
-    vehSec:CreateToggle({ Name = "Vehicle ESP", CurrentValue = CONFIG.espVehicles, Callback = function(v) CONFIG.espVehicles = v end })
-    vehSec:CreateToggle({ Name = "Draw Vehicle Box", CurrentValue = CONFIG.espVehBox, Callback = function(v) CONFIG.espVehBox = v end })
-    vehSec:CreateToggle({ Name = "Draw Crew (Inside)", CurrentValue = CONFIG.espVehCrew, Callback = function(v) CONFIG.espVehCrew = v end })
-    vehSec:CreateColorPicker({ Name = "Crew Color", Color = COL.vehCrew, Callback = function(c) COL.vehCrew = c end })
+	local vehSec = espTab:CreateSection("Vehicles")
+	vehSec:CreateToggle({ Name = "Vehicle ESP", CurrentValue = CONFIG.espVehicles, Callback = function(v) CONFIG.espVehicles = v end })
+	vehSec:CreateToggle({ Name = "Draw Vehicle Box", CurrentValue = CONFIG.espVehBox, Callback = function(v) CONFIG.espVehBox = v end })
+	vehSec:CreateToggle({ Name = "Draw Crew (Inside)", CurrentValue = CONFIG.espVehCrew, Callback = function(v) CONFIG.espVehCrew = v end })
+	vehSec:CreateColorPicker({ Name = "Crew Color", Color = COL.vehCrew, Callback = function(c) COL.vehCrew = c end })
 
-    -- ✅ TAB 2: AIMBOT
-    local aimTab = win:CreateTab("Aimbot")
-    local aimSec = aimTab:CreateSection("Aim Settings")
-    aimSec:CreateToggle({ Name = "Aimbot Master", CurrentValue = CONFIG.aim, Callback = function(v) CONFIG.aim = v end })
-    aimSec:CreateDropdown({ Name = "Key", Options = { "MouseButton2", "MouseButton1", "LeftShift", "E", "Q", "C" }, CurrentOption = CONFIG.aimKey, Callback = function(v) CONFIG.aimKey = v end })
-    aimSec:CreateDropdown({ Name = "Target Bone", Options = { "Head", "Torso", "Nearest" }, CurrentOption = CONFIG.aimPart, Callback = function(v) CONFIG.aimPart = v end })
-    aimSec:CreateToggle({ Name = "Predict Drop/Lead", CurrentValue = CONFIG.aimPredict, Callback = function(v) CONFIG.aimPredict = v end })
-    aimSec:CreateToggle({ Name = "Visibility Check", CurrentValue = CONFIG.aimVisible, Callback = function(v) CONFIG.aimVisible = v end })
+	-- ✅ TAB 2: AIMBOT
+	local aimTab = win:CreateTab("Aimbot")
+	local aimSec = aimTab:CreateSection("Aim Settings")
+	aimSec:CreateToggle({ Name = "Aimbot Master", CurrentValue = CONFIG.aim, Callback = function(v) CONFIG.aim = v end })
+	aimSec:CreateDropdown({ Name = "Key", Options = { "MouseButton2", "MouseButton1", "LeftShift", "E", "Q", "C" }, CurrentOption = CONFIG.aimKey, Callback = function(v) CONFIG.aimKey = v end })
+	aimSec:CreateDropdown({ Name = "Target Bone", Options = { "Head", "Torso", "Nearest" }, CurrentOption = CONFIG.aimPart, Callback = function(v) CONFIG.aimPart = v end })
+	aimSec:CreateToggle({ Name = "Predict Drop/Lead", CurrentValue = CONFIG.aimPredict, Callback = function(v) CONFIG.aimPredict = v end })
+	aimSec:CreateToggle({ Name = "Visibility Check", CurrentValue = CONFIG.aimVisible, Callback = function(v) CONFIG.aimVisible = v end })
 
-    local aimTune = aimTab:CreateSection("Aim Tuning")
-    aimTune:CreateSlider({ Name = "FOV Size (px)", Range = {5, 600}, CurrentValue = CONFIG.aimFov, Callback = function(v) CONFIG.aimFov = v end })
-    aimTune:CreateSlider({ Name = "Smoothness H", Range = {1, 100}, CurrentValue = CONFIG.aimSmoothH, Callback = function(v) CONFIG.aimSmoothH = v end })
-    aimTune:CreateSlider({ Name = "Smoothness V", Range = {1, 100}, CurrentValue = CONFIG.aimSmoothV, Callback = function(v) CONFIG.aimSmoothV = v end })
-    aimTune:CreateToggle({ Name = "No Recoil (Safe)", CurrentValue = CONFIG.noRecoil, Callback = function(v) CONFIG.noRecoil = v end })
+	local aimTune = aimTab:CreateSection("Aim Tuning")
+	aimTune:CreateSlider({ Name = "FOV Size (px)", Range = {5, 600}, CurrentValue = CONFIG.aimFov, Callback = function(v) CONFIG.aimFov = v end })
+	aimTune:CreateSlider({ Name = "Smoothness H", Range = {1, 100}, CurrentValue = CONFIG.aimSmoothH, Callback = function(v) CONFIG.aimSmoothH = v end })
+	aimTune:CreateSlider({ Name = "Smoothness V", Range = {1, 100}, CurrentValue = CONFIG.aimSmoothV, Callback = function(v) CONFIG.aimSmoothV = v end })
+	aimTune:CreateToggle({ Name = "No Recoil (Safe)", CurrentValue = CONFIG.noRecoil, Callback = function(v) CONFIG.noRecoil = v end })
 
-    -- ✅ TAB 3: TRIGGERBOT
-    local trigTab = win:CreateTab("Triggerbot")
-    local trigSec = trigTab:CreateSection("Trigger Settings")
-    trigSec:CreateToggle({ Name = "Enable Triggerbot", CurrentValue = CONFIG.triggerBot, Callback = function(v) CONFIG.triggerBot = v end })
-    trigSec:CreateDropdown({ Name = "Trigger Bone", Options = { "Head", "Torso" }, CurrentOption = CONFIG.triggerPart, Callback = function(v) CONFIG.triggerPart = v end })
-    trigSec:CreateDropdown({ Name = "Weapon Mode", Options = { "Click (Semi/Sniper)", "Hold (Auto/LMG)" }, CurrentOption = "Click (Semi/Sniper)", Callback = function(v) 
-        if v:find("Click") then CONFIG.triggerMode = "Click" else CONFIG.triggerMode = "Hold" end 
-    end })
+	-- ✅ TAB 3: TRIGGERBOT
+	local trigTab = win:CreateTab("Triggerbot")
+	local trigSec = trigTab:CreateSection("Trigger Settings")
+	trigSec:CreateToggle({ Name = "Enable Triggerbot", CurrentValue = CONFIG.triggerBot, Callback = function(v) CONFIG.triggerBot = v end })
+	trigSec:CreateDropdown({ Name = "Trigger Bone", Options = { "Head", "Torso" }, CurrentOption = CONFIG.triggerPart, Callback = function(v) CONFIG.triggerPart = v end })
+	trigSec:CreateDropdown({ Name = "Weapon Mode", Options = { "Click (Semi/Sniper)", "Hold (Auto/LMG)" }, CurrentOption = "Click (Semi/Sniper)", Callback = function(v)
+		if tostring(v):find("Click") then CONFIG.triggerMode = "Click" else CONFIG.triggerMode = "Hold" end
+	end })
 
-    local trigTune = trigTab:CreateSection("Trigger Tuning")
-    trigTune:CreateSlider({ Name = "Trigger Radius (px)", Range = {1, 50}, CurrentValue = CONFIG.triggerRadius, Callback = function(v) CONFIG.triggerRadius = v end })
-    trigTune:CreateSlider({ Name = "Trigger Delay (ms)", Range = {10, 1500}, CurrentValue = CONFIG.triggerDelay, Callback = function(v) CONFIG.triggerDelay = v end })
+	local trigTune = trigTab:CreateSection("Trigger Tuning")
+	trigTune:CreateSlider({ Name = "Trigger Radius (px)", Range = {1, 50}, CurrentValue = CONFIG.triggerRadius, Callback = function(v) CONFIG.triggerRadius = v end })
+	trigTune:CreateSlider({ Name = "Trigger Delay (ms)", Range = {10, 1500}, CurrentValue = CONFIG.triggerDelay, Callback = function(v) CONFIG.triggerDelay = v end })
 
-    -- ✅ TAB 4: WORLD
-    local worldTab = win:CreateTab("World")
-    local worldSec = worldTab:CreateSection("Environment")
-    worldSec:CreateToggle({ Name = "No Fog", CurrentValue = CONFIG.noFog, Callback = function(v) CONFIG.noFog = v end })
-    worldSec:CreateToggle({ Name = "Fullbright", CurrentValue = CONFIG.fullbright, Callback = function(v) CONFIG.fullbright = v end })
-    worldSec:CreateToggle({ Name = "No Suppression", CurrentValue = CONFIG.noSuppress, Callback = function(v) CONFIG.noSuppress = v end })
+	-- ✅ TAB 4: SPECTATE (ISOLATED CAMERA ZONE + QOL)
+	local specTab = win:CreateTab("Spectate")
+	local specCtrl = specTab:CreateSection("Spectate Controls (แยกโซนกล้องปลอดภัย)")
+
+	local selectedPlayerName = nil
+	local playerDropdown = nil
+
+	local specMasterToggle = specCtrl:CreateToggle({
+		Name = "🎥 Enable Spectate (เปิด/ปิดโหมดส่องผู้เล่น)",
+		Description = "พักระบบ Aimbot/Triggerbot อัตโนมัติขณะส่อง และคืนกล้องให้ตัวเองทันทีที่ปิด",
+		CurrentValue = false,
+		Callback = function(v)
+			if v then
+				local target = selectedPlayerName and Players:FindFirstChild(selectedPlayerName) or nil
+				if target and target ~= plr then
+					Spectate.Start(target)
+				else
+					Spectate.Cycle(1)
+				end
+			else
+				Spectate.Stop()
+			end
+		end
+	})
+
+	specCtrl:CreateDropdown({
+		Name = "🎯 Target Filter (กรองเป้าหมายที่จะส่อง)",
+		Options = { "Enemies Only", "Teammates Only", "All Players" },
+		CurrentOption = Spectate.Config.FilterMode,
+		Callback = function(opt)
+			local val = type(opt) == "table" and opt[1] or opt
+			Spectate.Config.FilterMode = tostring(val or "Enemies Only")
+			if playerDropdown and playerDropdown.Refresh then
+				pcall(function() playerDropdown:Refresh(Spectate.GetDropdownNames()) end)
+			end
+		end
+	})
+
+	playerDropdown = specCtrl:CreateDropdown({
+		Name = "👤 Select Player (เลือกชื่อผู้เล่นที่จะส่อง)",
+		Options = Spectate.GetDropdownNames(),
+		CurrentOption = "- No Players Found -",
+		Callback = function(opt)
+			local raw = type(opt) == "table" and opt[1] or opt
+			local pName = tostring(raw or ""):match("^(%S+)")
+			if pName and pName ~= "-" then
+				selectedPlayerName = pName
+				local pObj = Players:FindFirstChild(pName)
+				if pObj then
+					Spectate.Start(pObj)
+					if specMasterToggle and specMasterToggle.Set then
+						pcall(function() specMasterToggle:Set(true, true) end)
+					end
+				end
+			end
+		end
+	})
+
+	specCtrl:CreateButton({
+		Name = "🔄 Refresh Player List (อัปเดตรายชื่อผู้เล่นล่าสุด)",
+		Callback = function()
+			if playerDropdown and playerDropdown.Refresh then
+				pcall(function() playerDropdown:Refresh(Spectate.GetDropdownNames()) end)
+			end
+		end
+	})
+
+	specCtrl:CreateButton({
+		Name = "⏮️ Previous Player (ส่องคนก่อนหน้า [ ปุ่ม [ ])",
+		Callback = function()
+			Spectate.Cycle(-1)
+		end
+	})
+
+	specCtrl:CreateButton({
+		Name = "⏭️ Next Player (ส่องคนถัดไป [ ปุ่ม ] ])",
+		Callback = function()
+			Spectate.Cycle(1)
+		end
+	})
+
+	specCtrl:CreateButton({
+		Name = "🎯 Spectate Crosshair Target (ส่องคนที่อยู่กลางเป้า [ ปุ่ม V ])",
+		Callback = function()
+			Spectate.SpectateCrosshairTarget()
+		end
+	})
+
+	specCtrl:CreateButton({
+		Name = "🛑 Stop & Return Camera (ออกจากโหมดส่องทันที [ Backspace ])",
+		Callback = function()
+			Spectate.Stop()
+			if specMasterToggle and specMasterToggle.Set then
+				pcall(function() specMasterToggle:Set(false, true) end)
+			end
+		end
+	})
+
+	local specCamSec = specTab:CreateSection("Camera Mode & QoL Settings")
+
+	specCamSec:CreateDropdown({
+		Name = "📷 Camera View Mode (มุมมองกล้อง)",
+		Options = { "1: Follow (ตามหลัง)", "2: Orbit (หมุนรอบตัวอัตโนมัติ)", "3: First Person (มุมมองบุคคลที่ 1)" },
+		CurrentOption = "1: Follow (ตามหลัง)",
+		Callback = function(opt)
+			local s = tostring(type(opt) == "table" and opt[1] or opt)
+			if s:find("^1") then Spectate.SetMode(1)
+			elseif s:find("^2") then Spectate.SetMode(2)
+			elseif s:find("^3") then Spectate.SetMode(3) end
+		end
+	})
+
+	specCamSec:CreateSlider({
+		Name = "📏 Camera Distance (ระยะซูมกล้อง Studs)",
+		Range = { 3, 65 },
+		Increment = 1,
+		CurrentValue = Spectate.Config.DefaultDistance,
+		Callback = function(v)
+			Spectate.SetDistance(v)
+		end
+	})
+
+	specCamSec:CreateSlider({
+		Name = "🌀 Orbit Speed (ความเร็วหมุนรอบตัว)",
+		Range = { 0.1, 3.0 },
+		Increment = 0.1,
+		CurrentValue = Spectate.Config.OrbitSpeed,
+		Callback = function(v)
+			Spectate.Config.OrbitSpeed = v
+		end
+	})
+
+	specCamSec:CreateToggle({
+		Name = "🛡️ Camera Wall-Collision (กันกล้องจมดิน/ทะลุกำแพง)",
+		CurrentValue = Spectate.Config.WallCollision,
+		Callback = function(v) Spectate.Config.WallCollision = v end
+	})
+
+	specCamSec:CreateToggle({
+		Name = "🔁 Auto-Switch on Target Death (สลับคนอัตโนมัติเมื่อเป้าหมายตาย)",
+		CurrentValue = Spectate.Config.AutoSwitchOnDeath,
+		Callback = function(v) Spectate.Config.AutoSwitchOnDeath = v end
+	})
+
+	specCamSec:CreateToggle({
+		Name = "📊 Show Spectate Telemetry HUD (แสดงข้อมูล HP/ปืน/อาชีพ ด้านบนจอ)",
+		CurrentValue = Spectate.Config.ShowHUD,
+		Callback = function(v)
+			Spectate.Config.ShowHUD = v
+			if not v then hideSpecHud() end
+		end
+	})
+
+	-- ✅ TAB 5: WORLD
+	local worldTab = win:CreateTab("World")
+	local worldSec = worldTab:CreateSection("Environment")
+	worldSec:CreateToggle({ Name = "No Fog", CurrentValue = CONFIG.noFog, Callback = function(v) CONFIG.noFog = v end })
+	worldSec:CreateToggle({ Name = "Fullbright", CurrentValue = CONFIG.fullbright, Callback = function(v) CONFIG.fullbright = v end })
+	worldSec:CreateToggle({ Name = "No Suppression", CurrentValue = CONFIG.noSuppress, Callback = function(v) CONFIG.noSuppress = v end })
 else
-    warn("[Sill X] UI ไม่สามารถโหลดได้ แต่ระบบ ESP/Aimbot จะยังทำงานอยู่เบื้องหลัง")
+	warn("[Sill X] UI ไม่สามารถโหลดได้ แต่ระบบ ESP/Aimbot จะยังทำงานอยู่เบื้องหลัง")
 end
 
 --------------------------------------------------------------------------------
--- LOOPS & BINDINGS
+-- LOOPS, HOTKEYS & CLEANUP BINDINGS
 --------------------------------------------------------------------------------
 
 RunService:BindToRenderStep("CWAim", Enum.RenderPriority.Camera.Value + 1, function(dt) pcall(aimPass, dt) end)
 RunService:BindToRenderStep("CWESP", Enum.RenderPriority.Camera.Value + 2, function() pcall(renderPass) pcall(worldPass) end)
 
-UserInputService.InputBegan:Connect(function(input, typing)
+local mainInputConn = UserInputService.InputBegan:Connect(function(input, typing)
 	if _G.__CWAR ~= GEN or typing then return end
+
+	-- Panic Key (F1): Disables Aimbot, Silent, Triggerbot AND immediately exits Spectate!
 	local k = keyFromName(CONFIG.panicKey)
 	if k and input.KeyCode == k then
 		CONFIG.aim, CONFIG.silent, CONFIG.triggerBot = false, false, false
+		Spectate.Stop()
+		return
+	end
+
+	-- Spectate Quick Hotkeys:
+	-- [ : Previous Player | ] : Next Player | Backspace : Stop Spectating | V : Spectate Crosshair Target
+	if input.KeyCode == Enum.KeyCode.LeftBracket then
+		Spectate.Cycle(-1)
+	elseif input.KeyCode == Enum.KeyCode.RightBracket then
+		Spectate.Cycle(1)
+	elseif input.KeyCode == Enum.KeyCode.Backspace and Spectate.IsActive() then
+		Spectate.Stop()
+	elseif input.KeyCode == Enum.KeyCode.V and UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) then
+		-- LeftAlt + V: Quick-Spectate player near crosshair (avoids accidental V presses in-game!)
+		if Spectate.IsActive() then
+			Spectate.Stop()
+		else
+			Spectate.SpectateCrosshairTarget()
+		end
 	end
 end)
 
-print("[Sill X] Loaded. Press Home to toggle UI.")
+_G.__CWAR_CLEANUP = function()
+	pcall(function() Spectate.Stop() end)
+	pcall(function() RunService:UnbindFromRenderStep("CWAim") end)
+	pcall(function() RunService:UnbindFromRenderStep("CWESP") end)
+	pcall(function() RunService:UnbindFromRenderStep("CWSpec") end)
+	if mainInputConn then pcall(function() mainInputConn:Disconnect() end) end
+	if SilL and SilL.Destroy then pcall(function() SilL:Destroy() end) end
+end
+
+print("[Sill X | Cold War] Loaded with Isolated Spectate System. Press Home to toggle UI.")
